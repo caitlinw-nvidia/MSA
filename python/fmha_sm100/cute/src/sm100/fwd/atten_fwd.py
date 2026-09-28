@@ -65,6 +65,9 @@ class SparseAttentionForwardSm100:
     """SM100 sparse attention forward kernel."""
 
     k_tile = 64  # UTCMMA bf16 K-tile (matches sparse_fwd_utcmma.py)
+    # Q ring depth used for FP8 Q on Rubin (SM107). Class attribute so
+    # ablations can override it; BF16 keeps the Q2 ring set in __init__.
+    rubin_fp8_q_stage = 4
 
     def __init__(
         self,
@@ -416,7 +419,7 @@ class SparseAttentionForwardSm100:
         # the doubled-K flag so enable_2x_fp8=False is a clean K64-vs-K32
         # ablation.
         if const_expr(self.is_rubin and self.q_dtype == cutlass.Float8E4M3FN):
-            self.q_stage = 4
+            self.q_stage = int(self.rubin_fp8_q_stage)
         if const_expr((self.rubin_qk_fp8 or self.rubin_pv_fp8) and sm107_utils is None):
             raise RuntimeError("Rubin FP8 requires a CuTe DSL build with rubin_helpers")
         if const_expr(self.enable_2x_fp8):
