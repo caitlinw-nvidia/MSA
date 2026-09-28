@@ -407,11 +407,16 @@ class SparseAttentionForwardSm100:
         # enable_2x_fp8 implies both operands are FP8, so one K width covers
         # both MMAs.
         self.rubin_fp8_mma_k = 64 if self.enable_2x_fp8 else 32
-        # Rubin uses a deeper Q ring: Q4 for FP8 and Q5 for BF16. Blackwell
-        # keeps the Q2 ring configured in __init__. Kept independent of the
-        # doubled-K flag so enable_2x_fp8=False is a clean K64-vs-K32 ablation.
-        if const_expr(self.is_rubin):
-            self.q_stage = 4 if self.q_dtype == cutlass.Float8E4M3FN else 5
+        # Rubin uses a deeper Q4 ring for FP8 Q (4 x 16 KB stages, 103 KB of
+        # dynamic SMEM with this kernel's K/V staging). BF16 keeps the Q2 ring
+        # configured in __init__ on every architecture: the nv_dev Q5 BF16
+        # ring costs 5 x 32 KB and pushed this kernel to 234 KB per block on
+        # SM107, which measured 0.72x-0.81x attention-kernel throughput
+        # against dev in the 2026-09-28 Hecate comparison. Kept independent of
+        # the doubled-K flag so enable_2x_fp8=False is a clean K64-vs-K32
+        # ablation.
+        if const_expr(self.is_rubin and self.q_dtype == cutlass.Float8E4M3FN):
+            self.q_stage = 4
         if const_expr((self.rubin_qk_fp8 or self.rubin_pv_fp8) and sm107_utils is None):
             raise RuntimeError("Rubin FP8 requires a CuTe DSL build with rubin_helpers")
         if const_expr(self.enable_2x_fp8):
