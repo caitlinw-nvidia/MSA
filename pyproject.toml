@@ -58,6 +58,7 @@ fmha_sm100 = [
     "cute/**/*.md",
     "cute/**/*.ini",
     "cute/**/*.txt",
+    "cute/src/blackwell_prefill/vendor_manifest.json",
     "cute/Makefile",
     "csrc/**/*",
     "decode_q8kv4/csrc/**/*",

@@ -32,9 +32,7 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "python"))
-# NVFP4 sparse is only exposed by the cute subdir API
-# (sparse_atten_nvfp4_kv_func); the root fmha_sm100 dense entry does not
-# carry NVFP4 K/V scales. Add the subdir to sys.path for the nvfp4 branch.
+# Quantization and the explicit legacy NVFP4 benchmark use the CuTe subdir.
 _SPARSE_SUBDIR = REPO_ROOT / "python" / "fmha_sm100" / "cute"
 sys.path.insert(0, str(_SPARSE_SUBDIR))
 
@@ -58,6 +56,8 @@ DTYPE = "fp8"
 CSV_FILE = None
 DRY_RUN_MS = 200
 REPEAT_MS = 2000
+INCLUDE_PLAN = False
+NVFP4_BACKEND = "auto"
 
 
 def parse_int_list(value: str):
@@ -169,11 +169,14 @@ def bench_dense(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     qo_lens = torch.full((b,), q_len, dtype=torch.int32)
     kv_lens = torch.full((b,), k_len, dtype=torch.int32)
 
-    plan_info = fmha_sm100_plan(qo_lens, kv_lens, h_q,
-        num_kv_splits=num_kv_splits,
-        output_maxscore=True,
-        num_kv_heads=h_k,
-    )
+    def make_plan():
+        return fmha_sm100_plan(qo_lens, kv_lens, h_q,
+            num_kv_splits=num_kv_splits,
+            output_maxscore=True,
+            num_kv_heads=h_k,
+        )
+
+    plan_info = make_plan()
 
     out = torch.empty_like(q).to(torch.bfloat16)
 
@@ -184,7 +187,7 @@ def bench_dense(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     skip_maxscore = maxscore_elems >= (1 << 31)
     want_maxscore = output_mode in ("maxscore", "full") and not skip_maxscore
     fun = lambda: fmha_sm100(q, k, v,
-        plan_info=plan_info, out=out,
+        plan_info=make_plan() if INCLUDE_PLAN else plan_info, out=out,
         output_maxscore=want_maxscore,
         output_o=output_mode in ("o", "full") or skip_maxscore,
     )
@@ -234,12 +237,15 @@ def bench_paged(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     qo_offset_val = k_len - q_len if causal else 0
     qo_offset_tensor = torch.full((b,), qo_offset_val, dtype=torch.int32) if causal else None
 
-    plan_info = fmha_sm100_plan(qo_lens, kv_lens, h_q,
-        qo_offset=qo_offset_tensor,
-        page_size=page_size,
-        output_maxscore=True,
-        num_kv_heads=h_k,
-    )
+    def make_plan():
+        return fmha_sm100_plan(qo_lens, kv_lens, h_q,
+            qo_offset=qo_offset_tensor,
+            page_size=page_size,
+            output_maxscore=True,
+            num_kv_heads=h_k,
+        )
+
+    plan_info = make_plan()
 
     out = torch.empty_like(q).to(torch.bfloat16)
 
@@ -248,7 +254,7 @@ def bench_paged(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     skip_maxscore = maxscore_elems >= (1 << 31)
     want_maxscore = output_mode in ("maxscore", "full") and not skip_maxscore
     fun = lambda: fmha_sm100(q, k_cache, v_cache,
-        plan_info=plan_info, kv_indices=kv_indices, out=out,
+        plan_info=make_plan() if INCLUDE_PLAN else plan_info, kv_indices=kv_indices, out=out,
         output_maxscore=want_maxscore,
         output_o=output_mode in ("o", "full") or skip_maxscore,
     )
@@ -282,13 +288,8 @@ def _make_first_topk_q2k(b, q_len, k_len, h_k, topk, blk_kv, device):
     return q2k.contiguous(), actual
 
 
-def bench_sparse_nvfp4(b, h_q, h_k, q_len, k_len, d, topk, causal, use_mbu=False):
-    """NVFP4 sparse prefill via the cute sparse_atten_nvfp4_kv_func.
-
-    The root fmha_sm100 dense entry does not carry NVFP4 K/V scales, so this
-    path uses the subdir API directly with flat (non-paged) varlen K/V and a
-    first-top-K CSR built by build_k2q_csr.
-    """
+def _bench_sparse_nvfp4_cute(b, h_q, h_k, q_len, k_len, d, topk, causal, use_mbu=False):
+    """Legacy flat CuTe NVFP4 benchmark, retained for explicit comparisons."""
     if d != 128:
         raise ValueError("NVFP4 sparse benchmark supports head_dim=128 only")
     if q_len <= 32:
@@ -309,22 +310,27 @@ def bench_sparse_nvfp4(b, h_q, h_k, q_len, k_len, d, topk, causal, use_mbu=False
     cu_seqlens_k = torch.tensor([0] + list(np.cumsum([k_len] * b)), dtype=torch.int32, device=device)
     total_rows = b * ((k_len + blk_kv - 1) // blk_kv)
 
-    k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
-        q2k, cu_seqlens_q, cu_seqlens_k, blk_kv,
-        total_k=total_k, max_seqlen_k=k_len, max_seqlen_q=q_len,
-        total_rows=total_rows, qhead_per_kv=h_q // h_k, return_schedule=True,
-    )
+    def make_csr():
+        return build_k2q_csr(
+            q2k, cu_seqlens_q, cu_seqlens_k, blk_kv,
+            total_k=total_k, max_seqlen_k=k_len, max_seqlen_q=q_len,
+            total_rows=total_rows, qhead_per_kv=h_q // h_k, return_schedule=True,
+        )
+
+    k2q_row_ptr, k2q_q_indices, schedule = make_csr()
     softmax_scale = d ** -0.5
 
-    fun = lambda: sparse_atten_nvfp4_kv_func(
-        q, k_q.data, v_q.data,
-        k_q.scale_128x4, v_q.scale_128x4, k_q.global_scale, v_q.global_scale,
-        k2q_row_ptr, k2q_q_indices, topk,
-        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=q_len, max_seqlen_k=k_len, blk_kv=blk_kv,
-        causal=causal, softmax_scale=softmax_scale,
-        partial_dtype=torch.bfloat16, return_softmax_lse=False, schedule=schedule,
-    )
+    def fun():
+        csr = make_csr() if INCLUDE_PLAN else (k2q_row_ptr, k2q_q_indices, schedule)
+        return sparse_atten_nvfp4_kv_func(
+            q, k_q.data, v_q.data,
+            k_q.scale_128x4, v_q.scale_128x4, k_q.global_scale, v_q.global_scale,
+            csr[0], csr[1], topk,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=q_len, max_seqlen_k=k_len, blk_kv=blk_kv,
+            causal=causal, softmax_scale=softmax_scale,
+            partial_dtype=torch.bfloat16, return_softmax_lse=False, schedule=csr[2],
+        )
     _ = fun()
     measurements = bench_gpu_time(fun, dry_run_time_ms=DRY_RUN_MS, repeat_time_ms=REPEAT_MS)
     mean_ms = float(np.median(measurements))
@@ -338,6 +344,75 @@ def bench_sparse_nvfp4(b, h_q, h_k, q_len, k_len, d, topk, causal, use_mbu=False
     gbs = total_bytes / (mean_ms * 1e-3) / 1e9
     metric = gbs / HBM_PEAK_GBS if use_mbu else tflops / PEAK_TFLOPS["nvfp4"]
     return mean_ms, std_ms, tflops, gbs, metric, 1.0
+
+
+def _nvfp4_head_slot_cache(k_q, v_q, b, k_len, h_k):
+    """Repack the existing quantized inputs; do not generate different values."""
+    from fmha_sm100.prefill_q8kv4 import interleave_v_scales
+    from quantize import nvfp4_scale_128x4_offset
+
+    pages = b * (k_len // 128)
+    cache = torch.empty((pages, 2 * h_k, 128, 72), device=k_q.data.device, dtype=torch.uint8)
+    for index, quantized in enumerate((k_q, v_q)):
+        data = quantized.data.reshape(b, k_len // 128, 128, h_k, 64)
+        data = data.permute(0, 1, 3, 2, 4).reshape(pages, h_k, 128, 64)
+        rows, cols = quantized.logical_scale_shape
+        row = torch.arange(rows, device=data.device)[:, None]
+        col = torch.arange(cols, device=data.device)[None, :]
+        offsets = nvfp4_scale_128x4_offset(row, col, cols)
+        scales = quantized.scale_128x4.view(torch.uint8).reshape(-1)[offsets]
+        scales = scales.reshape(b, k_len // 128, 128, h_k, 8)
+        scales = scales.permute(0, 1, 3, 2, 4).reshape(pages, h_k, 128, 8).contiguous()
+        if index == 1:
+            scales = interleave_v_scales(scales.view(torch.float8_e4m3fn)).view(torch.uint8)
+        slots = cache[:, index::2].flatten(2)
+        slots[..., :128 * 64].copy_(data.flatten(2))
+        slots[..., 128 * 64:].copy_(scales.flatten(2))
+    return cache[:, 0::2], cache[:, 1::2]
+
+
+def bench_sparse_nvfp4(b, h_q, h_k, q_len, k_len, d, topk, causal, use_mbu=False):
+    """Blackwell uses the public NVFP4 route; other GPUs retain the legacy sweep."""
+    capability = torch.cuda.get_device_capability(GPU_ID)
+    if NVFP4_BACKEND == "cute_dsl" or (NVFP4_BACKEND == "auto" and capability not in ((10, 0), (10, 3))):
+        return _bench_sparse_nvfp4_cute(b, h_q, h_k, q_len, k_len, d, topk, causal, use_mbu)
+    if d != 128 or q_len <= 32 or k_len % 128:
+        raise ValueError("NVFP4 paged prefill needs head_dim=128, q_len>32, and page-aligned KV length")
+    _, _, quantize = _load_nvfp4_backend()
+    device = f"cuda:{GPU_ID}"
+    q = torch.randn(b * q_len, h_q, d, dtype=torch.bfloat16, device=device).to(torch.float8_e4m3fn)
+    k_src = torch.randn(b * k_len, h_k, d, dtype=torch.bfloat16, device=device)
+    v_src = torch.randn(b * k_len, h_k, d, dtype=torch.bfloat16, device=device)
+    k_q, v_q = quantize(k_src, v_src)
+    k, v = _nvfp4_head_slot_cache(k_q, v_q, b, k_len, h_k)
+    q2k, actual = _make_first_topk_q2k(b, q_len, k_len, h_k, topk, 128, device)
+    indices = q2k.permute(1, 0, 2).contiguous()
+    pages = torch.arange(b * (k_len // 128), dtype=torch.int32, device=device).reshape(b, -1)
+    qo_lens = torch.full((b,), q_len, dtype=torch.int32)
+    kv_lens = torch.full((b,), k_len, dtype=torch.int32)
+
+    def make_plan():
+        return fmha_sm100_plan(qo_lens, kv_lens, h_q, num_kv_heads=h_k, page_size=128,
+                               kv_block_num=topk, causal=causal, output_maxscore=False,
+                               prefill_backend=NVFP4_BACKEND, block_scale_shift=3)
+
+    plan = make_plan()
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
+
+    def fun():
+        return fmha_sm100(q, k, v, plan_info=make_plan() if INCLUDE_PLAN else plan,
+                          kv_indices=pages, kv_block_indexes=indices, out=out,
+                          k_scale=k_q.global_scale, v_scale=v_q.global_scale,
+                          output_maxscore=False)
+
+    fun()
+    measurements = bench_gpu_time(fun, dry_run_time_ms=DRY_RUN_MS, repeat_time_ms=REPEAT_MS)
+    median = float(np.median(measurements))
+    effective_k = min(actual * 128, k_len)
+    tflops = attention_tflops(qo_lens, torch.full((b,), effective_k), d, d, h_q, False, median)
+    nbytes = compute_nvfp4_sparse_bytes(b, h_q, h_k, q_len, effective_k, d, actual)
+    gbs = nbytes / (median * 1e-3) / 1e9
+    return median, float(np.std(measurements)), tflops, gbs, gbs / HBM_PEAK_GBS if use_mbu else tflops / PEAK_TFLOPS["nvfp4"], 1.0
 
 
 def bench_sparse(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
@@ -381,18 +456,21 @@ def bench_sparse(b, h_q, h_k, q_len, k_len, d, output_mode, causal, dtype_str,
     selected_blocks = torch.arange(actual_block_num, device=device, dtype=torch.int32)
     kv_block_indexes[:, :, :actual_block_num] = selected_blocks.view(1, 1, -1)
 
-    plan_info = fmha_sm100_plan(qo_lens, kv_lens, h_q,
-        qo_offset=qo_offset_tensor,
-        page_size=page_size,
-        kv_block_num=kv_block_num,
-        num_kv_heads=h_k,
-    )
+    def make_plan():
+        return fmha_sm100_plan(qo_lens, kv_lens, h_q,
+            qo_offset=qo_offset_tensor,
+            page_size=page_size,
+            kv_block_num=kv_block_num,
+            num_kv_heads=h_k,
+        )
+
+    plan_info = make_plan()
 
     out = torch.empty_like(q).to(torch.bfloat16)
 
     fun = lambda: fmha_sm100(
         q, k_cache, v_cache,
-        plan_info=plan_info,
+        plan_info=make_plan() if INCLUDE_PLAN else plan_info,
         kv_indices=kv_indices, out=out,
         kv_block_indexes=kv_block_indexes,
     )
@@ -535,7 +613,7 @@ NVFP4_SECTIONS = {"sparse_prefill"}
 
 
 def main():
-    global GPU_ID, DTYPE, CSV_FILE, DRY_RUN_MS, REPEAT_MS
+    global GPU_ID, DTYPE, CSV_FILE, DRY_RUN_MS, REPEAT_MS, INCLUDE_PLAN, NVFP4_BACKEND
 
     parser = argparse.ArgumentParser(description="MiniMax sparse attention sweep benchmark")
     parser.add_argument("--gpu", type=int, default=0)
@@ -558,6 +636,10 @@ def main():
     parser.add_argument("--blk-kv", type=int, default=128)
     parser.add_argument("--dry-run-ms", type=int, default=200)
     parser.add_argument("--repeat-ms", type=int, default=2000)
+    parser.add_argument("--include-plan", action="store_true",
+                        help="Include plan construction in the existing CUDA-event timed callback")
+    parser.add_argument("--nvfp4-backend", choices=["auto", "q8kv4", "cute_dsl"], default="auto",
+                        help="auto uses the public NVFP4 route on Blackwell; cute_dsl reproduces the old benchmark")
     args = parser.parse_args()
 
     if args.head_dim != 128:
@@ -569,6 +651,8 @@ def main():
     DTYPE = args.dtype
     DRY_RUN_MS = args.dry_run_ms
     REPEAT_MS = args.repeat_ms
+    INCLUDE_PLAN = args.include_plan
+    NVFP4_BACKEND = args.nvfp4_backend
     torch.cuda.set_device(GPU_ID)
 
     if args.output:

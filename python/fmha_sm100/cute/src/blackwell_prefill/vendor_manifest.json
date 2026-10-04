@@ -1,0 +1,69 @@
+{
+  "repository": "MiniMax-AI/MSA",
+  "commit": "3b9fed061dd68d9c082c1874a9ac6ba966724f67",
+  "files": [
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/__init__.py",
+      "destination": "python/fmha_sm100/cute/src/blackwell_prefill/__init__.py",
+      "sha256": "dac678b4383e1e0b8b1257f4715371558c5e70f17f9a191427fc612dcfa1a93f"
+    },
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/atten_fwd_sm100.py",
+      "destination": "python/fmha_sm100/cute/src/blackwell_prefill/atten_fwd_sm100.py",
+      "sha256": "50fbb4fed85b16733b4b008617784cdd60638d12458172636f274b821267a03d"
+    },
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/combine.py",
+      "destination": "python/fmha_sm100/cute/src/blackwell_prefill/combine.py",
+      "sha256": "f25be1201bc44b2006d6cc62e356e79d40597f20f0cfed10314e9add950119a1"
+    }
+  ],
+  "adaptations": [
+    "import namespace rewrites",
+    "Blackwell-only architecture allowlist",
+    "direct use of dev source-aware AOT cache with blackwell_prefill_ keys",
+    "remove Rubin-only helpers, FP16 softmax, SM107 MMA, TMEM load-reduction, and architecture tuning branches",
+    "reuse dev common.seqlen_info for sequence metadata",
+    "reuse dev common helpers and existing Quack dependencies; apply selected Blackwell hunks with opt-in behavior; remove duplicated DSL package",
+    "reuse dev build_k2q_csr and SparseAttentionSchedule; omit donor CSR/schedule builders",
+    "build and pass the current Q gather4 descriptor with dev create_q_gather4_tma_desc for GQA 1/2/4"
+  ],
+  "shared_helper_changes": [
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/dsl/compile_utils.py",
+      "destination": "python/fmha_sm100/cute/src/common/cute_dsl_utils.py",
+      "sha256": "fb9aa5696804c69db4cf38e7a1ee6ac82612496104cd624a4d042634bd9180ed",
+      "scope": "selected required Blackwell functions/hunks only; existing dev behavior remains default"
+    },
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/dsl/cute_dsl_utils.py",
+      "destination": "python/fmha_sm100/cute/src/common/cute_dsl_utils.py",
+      "sha256": "f04adfc41dac5c14d460503430f9ca9a58d5630bc8e9d733ecb6fbd62698d5d3",
+      "scope": "selected required Blackwell functions/hunks only; existing dev behavior remains default"
+    },
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/dsl/pipeline.py",
+      "destination": "python/fmha_sm100/cute/src/common/pipeline.py",
+      "sha256": "08bf697600b57ec73140b8ca6cf6ade22545e0d8c3ab06717d56f21a1dcbdedd",
+      "scope": "selected required Blackwell functions/hunks only; existing dev behavior remains default"
+    },
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/dsl/softmax.py",
+      "destination": "python/fmha_sm100/cute/src/common/softmax.py",
+      "sha256": "2a53c89ab8f628deaaf61ba952f189c88a0e3657eb7df4e95f012ead59de1129",
+      "scope": "selected required Blackwell functions/hunks only; existing dev behavior remains default"
+    },
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/dsl/tma_utils.py",
+      "destination": "python/fmha_sm100/cute/src/common/tma_utils.py",
+      "sha256": "8b1de3841bf08a9e375e038c08c0d4d157854be0569e6ddbc984a7da5463e913",
+      "scope": "selected required Blackwell functions/hunks only; existing dev behavior remains default"
+    },
+    {
+      "source": "inference/msa_v1/attention/prefill/_common/dsl/utils.py",
+      "destination": "python/fmha_sm100/cute/src/common/utils.py",
+      "sha256": "63fb79979fe757a8e3063f456f81bee346c623b6d4dba5e9ecefead4a3007091",
+      "scope": "selected required Blackwell functions/hunks only; existing dev behavior remains default"
+    }
+  ]
+}
