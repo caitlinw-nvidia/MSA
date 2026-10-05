@@ -44,12 +44,21 @@ def _blackwell_prefill_enabled():
 
 
 def _supports_blackwell_prefill(device, *, topk, page_size=128, usable_sm_count=-1):
+    # Keep the established private entry point shared with C++ NVFP4 combine.
+    capability = torch.cuda.get_device_capability(device)
+    if capability == (10, 7):
+        value = os.environ.get("FMHA_SM100_RUBIN_PREFILL", "1")
+        if value not in ("0", "1"):
+            raise ValueError("FMHA_SM100_RUBIN_PREFILL must be 0 or 1")
+        enabled = value == "1"
+    else:
+        enabled = _blackwell_prefill_enabled()
     return (
-        _blackwell_prefill_enabled()
+        enabled
         and topk == 16
         and page_size == 128
         and usable_sm_count <= 0
-        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+        and capability in ((10, 0), (10, 3), (10, 7))
     )
 
 

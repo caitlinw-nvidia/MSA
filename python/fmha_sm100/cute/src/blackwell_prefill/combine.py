@@ -2185,7 +2185,7 @@ def combine(
     min_blocks_per_mp = 3 if has_output_scale and use_pdl else 0
 
     capability = torch.cuda.get_device_capability(o_out.device)
-    stages = 2
+    stages = 4 if capability == (10, 7) else 2
     key = (
         "blackwell_prefill_combine",
         capability,

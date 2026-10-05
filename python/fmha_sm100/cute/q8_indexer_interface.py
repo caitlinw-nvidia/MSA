@@ -83,11 +83,11 @@ def _kernel_source_digest() -> str:
     return digest.hexdigest()[:16]
 
 
-def _require_supported_device(device: torch.device) -> tuple[int, int]:
+def _require_supported_device(device: torch.device, *, prefill: bool = False) -> tuple[int, int]:
     capability = torch.cuda.get_device_capability(device)
-    if capability not in _SUPPORTED_CAPABILITIES:
+    if capability not in _SUPPORTED_CAPABILITIES and not (prefill and capability == (10, 7)):
         raise RuntimeError(
-            "Q8KV4/Q8KV8 indexers support only SM100 and SM103, "
+            "Q8KV4/Q8KV8 indexers support SM100/SM103, plus SM107 for Q8KV8 prefill, "
             f"got SM{capability[0]}{capability[1]}"
         )
     return capability
@@ -554,6 +554,7 @@ class _PrefillPlanState:
     plan_error: torch.Tensor
     task_capacity: int
     num_candidate_q_tiles: int
+    max_page_chunk: int
     total_q: int
     num_heads: int
     scores: torch.Tensor
@@ -562,7 +563,7 @@ class _PrefillPlanState:
 
 
 def _run_prefill_plan(state: _PrefillPlanState) -> None:
-    capability = _require_supported_device(state.block_table.device)
+    capability = _require_supported_device(state.block_table.device, prefill=True)
     plan_static = (
         Q8KV8PrefillIndexerPlanBuild.num_buckets,
         Q8KV8PrefillIndexerPlanBuild.q_tile,
@@ -593,12 +594,14 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
             Int32(state.num_candidate_q_tiles),
             Int32(state.task_capacity),
             Int32(state.num_heads),
+            Int32(state.max_page_chunk),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         ),
     )
     reset_compiled(state.task_counts, state.plan_error)
-    build_compiled(*build_args, state.num_candidate_q_tiles, state.task_capacity, state.num_heads)
+    build_compiled(*build_args, state.num_candidate_q_tiles, state.task_capacity,
+                   state.num_heads, state.max_page_chunk)
 
 
 class BatchPrefillIndexerQ8KV8Wrapper:
@@ -641,7 +644,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
 
         _check_cuda_tensor(cu_seqlens_q, name="cu_seqlens_q", dtype=torch.int32)
         device = cu_seqlens_q.device
-        _require_supported_device(device)
+        _require_supported_device(device, prefill=True)
         if _is_capturing(device):
             raise RuntimeError("plan() must be called outside CUDA Graph capture")
         if cu_seqlens_q.ndim != 1 or cu_seqlens_q.numel() < 2:
@@ -664,6 +667,15 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         total_rows = total_q * self._num_heads
         q_tile_capacity = -(-total_rows // q_tile) + batch - 1
         task_capacity = q_tile_capacity * -(-max_pages // _PREFILL_TASK_CAPACITY_PAGE_CHUNK)
+        # Use dev's multi-head Q-row count when sizing Rubin's work split.
+        max_page_chunk = Q8KV8PrefillIndexerPlanBuild.large_page_chunk
+        if torch.cuda.get_device_capability(device) == (10, 7):
+            clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
+            chunks_per_q_tile = max(1, clusters // q_tile_capacity)
+            max_page_chunk = max(
+                Q8KV8PrefillIndexerPlanBuild.min_page_chunk,
+                min(max_page_chunk, -(-max_pages // chunks_per_q_tile)),
+            )
         options = {"device": device}
         self._state = _PrefillPlanState(
             cu_seqlens_q=cu_seqlens_q,
@@ -683,6 +695,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             ),
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
+            max_page_chunk=max_page_chunk,
             num_candidate_q_tiles=batch * -(-max_seqlen_q * self._num_heads // q_tile),
             total_q=total_q,
             num_heads=self._num_heads,
@@ -710,7 +723,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         device = state.block_table.device
         _check_query(q, state.total_q, state.num_heads, device)
         _check_paged_cache(k_cache, dtype=torch.float8_e4m3fn, page_width=_HEAD_DIM, device=device)
-        capability = _require_supported_device(device)
+        capability = _require_supported_device(device, prefill=True)
         num_persistent_clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
         # Q rows are token * num_heads + head, matching the scores and TopK rows.
         q_rows = q.view(state.total_q * state.num_heads, 1, _HEAD_DIM)

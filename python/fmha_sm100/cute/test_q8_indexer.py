@@ -61,10 +61,17 @@ PREFILL_HEADS = (1, 2, 4)
 
 
 @pytest.fixture(autouse=True)
-def _require_sm100_family():
+def _require_sm100_family(request):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    capability = torch.cuda.get_device_capability()
+    name = request.node.originalname or request.node.name
+    is_prefill = ("prefill" in name or "topk_select" in name
+                  or (name == "test_metadata_slices_need_only_int32_alignment"
+                      and request.node.callspec.params["phase"] == "prefill"))
+    if capability == (10, 7) and is_prefill:
+        return
+    if capability not in ((10, 0), (10, 3)):
         pytest.skip("Q8KV4/Q8KV8 indexers require SM100 or SM103")
 
 

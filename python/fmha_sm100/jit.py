@@ -476,6 +476,10 @@ _MODULES = {
     # The ported indexer kernels were validated with IEEE division and denormals.
     "indexer_topk_select": ("indexer_topk_select", ("indexer_topk_select.cu",),
                             {"fast_math": False}, ""),
+    # A separate module identity avoids reusing a Blackwell-only TopK library.
+    "indexer_topk_select_sm107": ("indexer_topk_select_sm107", ("indexer_topk_select.cu",),
+                                {"fast_math": False},
+                                " -gencode=arch=compute_107a,code=sm_107a"),
     "q8kv4_indexer_decode": ("q8kv4_indexer_decode", ("q8kv4_indexer_decode.cu",),
                              {"fast_math": False}, ""),
 }
@@ -497,7 +501,7 @@ def build_module(key):
     return _build_library(recipe, f"{recipe.name} module", nvcc_flags, lambda _: sources)
 
 
-def prebuild_modules(keys=tuple(_MODULES), max_workers=None):
+def prebuild_modules(keys=tuple(k for k in _MODULES if k != "indexer_topk_select_sm107"), max_workers=None):
     """Compile the fixed modules that are not cached yet, in parallel, without loading them
     (an image build needs no GPU). Returns the keys compiled."""
     missing = [key for key in keys if _module_recipe(key)[0].lookup() is None]
@@ -538,4 +542,8 @@ def get_indexer_module(name):
     """Load one of ``_INDEXER_MODULE_SOURCES``. JIT compiles on first call."""
     if name not in _INDEXER_MODULE_SOURCES:
         raise KeyError(f"unknown indexer module {name!r}")
+    if name == "indexer_topk_select":
+        import torch
+        if torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7):
+            name = "indexer_topk_select_sm107"
     return _load_module(name)

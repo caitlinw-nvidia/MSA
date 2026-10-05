@@ -1,5 +1,8 @@
 # Blackwell sparse-prefill port
 
+This document records the base Blackwell port. For this branch's additional
+Rubin attention/combine and prefill-indexer support, see [RUBIN_PORT.md](RUBIN_PORT.md).
+
 Working branch: `v1_MSA_blackwell` on `caitlinw-nvidia/MSA`.
 
 - Base: vllm-project/MSA dev `5545effeafc567bee5ae664966fb2327292da37b`.

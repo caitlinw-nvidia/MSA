@@ -55,9 +55,48 @@ ADAPTER = types.SimpleNamespace(
 )
 
 
+class RubinOptionContract(unittest.TestCase):
+    def test_rubin_indexer_is_prefill_only(self):
+        namespace = {"torch": torch, "_SUPPORTED_CAPABILITIES": {(10, 0), (10, 3)}}
+        load_functions("python/fmha_sm100/cute/q8_indexer_interface.py",
+                       {"_require_supported_device"}, namespace)
+        require = namespace["_require_supported_device"]
+        with patch.object(torch.cuda, "get_device_capability", return_value=(10, 7)):
+            self.assertEqual(require("cuda:0", prefill=True), (10, 7))
+            with self.assertRaises(RuntimeError):
+                require("cuda:0")
+        for capability in ((10, 0), (10, 3)):
+            with patch.object(torch.cuda, "get_device_capability", return_value=capability):
+                self.assertEqual(require("cuda:0"), capability)
+                self.assertEqual(require("cuda:0", prefill=True), capability)
+
+    def test_defaults_ablation_and_invalid_requests(self):
+        namespace = {"torch": torch, "_RUBIN_CAPABILITY": (10, 7)}
+        load_functions(
+            "python/fmha_sm100/cute/src/blackwell_prefill/atten_fwd_sm100.py",
+            {"_resolve_rubin_options"}, namespace,
+        )
+        resolve = namespace["_resolve_rubin_options"]
+        self.assertEqual(resolve((10, 7), torch.float8_e4m3fn, None, None), (False, True))
+        self.assertEqual(resolve((10, 7), torch.float8_e4m3fn, True, None), (True, True))
+        self.assertEqual(resolve((10, 7), torch.float8_e4m3fn, False, False), (False, False))
+        for capability, dtype in (
+            ((10, 0), torch.float8_e4m3fn),
+            ((10, 3), torch.float8_e4m3fn),
+            ((10, 7), torch.bfloat16),
+        ):
+            self.assertEqual(resolve(capability, dtype, None, None), (False, False))
+            for flags in ((True, None), (None, True)):
+                with self.assertRaises(NotImplementedError):
+                    resolve(capability, dtype, *flags)
+        for flags in ((1, None), (None, "1")):
+            with self.assertRaises(TypeError):
+                resolve((10, 7), torch.float8_e4m3fn, *flags)
+
+
 class DispatchContract(unittest.TestCase):
     def setUp(self):
-        self.env = patch.dict(os.environ, {"FMHA_SM100_BLACKWELL_PREFILL": "1"})
+        self.env = patch.dict(os.environ, {"FMHA_SM100_BLACKWELL_PREFILL": "1", "FMHA_SM100_RUBIN_PREFILL": "1"})
         self.env.start()
         self.cap = patch.object(torch.cuda, "get_device_capability", return_value=(10, 3))
         self.cap.start()
@@ -80,10 +119,25 @@ class DispatchContract(unittest.TestCase):
                     self.q.dtype = self.k.dtype = self.v.dtype = dtype
                     self.assertTrue(self.accepts())
 
-    def test_rubin_and_other_architectures_keep_existing_route(self):
-        for capability in ((10, 7), (9, 0), (12, 0)):
+    def test_other_architectures_keep_existing_route(self):
+        for capability in ((9, 0), (12, 0)):
             with patch.object(torch.cuda, "get_device_capability", return_value=capability):
                 self.assertFalse(self.accepts())
+
+    def test_rubin_dispatch_and_independent_disable(self):
+        with patch.object(torch.cuda, "get_device_capability", return_value=(10, 7)):
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                self.q.dtype = self.k.dtype = self.v.dtype = dtype
+                self.assertTrue(self.accepts())
+            with patch.dict(os.environ, {"FMHA_SM100_BLACKWELL_PREFILL": "0"}):
+                self.assertTrue(self.accepts())
+            with patch.dict(os.environ, {"FMHA_SM100_RUBIN_PREFILL": "0"}):
+                self.assertFalse(self.accepts())
+            with patch.dict(os.environ, {"FMHA_SM100_RUBIN_PREFILL": "bad"}):
+                with self.assertRaises(ValueError):
+                    self.accepts()
+        with patch.dict(os.environ, {"FMHA_SM100_RUBIN_PREFILL": "0"}):
+            self.assertTrue(self.accepts())
 
     def test_unsupported_plans_and_custom_offsets(self):
         for key, value in (("kv_block_num", 8), ("page_size", 64), ("causal", False),

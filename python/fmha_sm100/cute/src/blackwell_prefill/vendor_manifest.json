@@ -65,5 +65,21 @@
       "sha256": "63fb79979fe757a8e3063f456f81bee346c623b6d4dba5e9ecefead4a3007091",
       "scope": "selected required Blackwell functions/hunks only; existing dev behavior remains default"
     }
-  ]
+  ],
+  "rubin_extension": {
+    "repository": "MiniMax-AI/MSA",
+    "commit": "9ae7751cf6b28f1c551a284de90dddf9971d621e",
+    "scope": [
+      "SM107 sparse-prefill forward and combine",
+      "Q8KV8 prefill indexer, adapted from e1639ac5f115a259de71e0a813becbffdde50389"
+    ],
+    "adaptations": [
+      "Retain Blackwell gather4 descriptor fix, explicit TMA transaction counts, generic-pointer prefetch, and dev AOT namespaces",
+      "Reuse unchanged dev rubin_helpers.py and rubin_softmax_helpers.py",
+      "Pass 448 explicitly to existing dev packed-FP16 softmax helper; preserve its default",
+      "Retain dev metadata and multi-head indexer task descriptor format",
+      "Keep decode architecture eligibility unchanged"
+    ]
+  },
+  "rubin_softmax_default": "FP32; P448 enabled for FP8 P; packed FP16 opt-in via enable_fp16_softmax=True"
 }
