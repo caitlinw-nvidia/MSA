@@ -15,6 +15,7 @@ can simply do::
 
     from fmha_sm100.sparse import (
         fp4_indexer_block_scores,      # block-score indexer (topk is caller-owned)
+        BatchDecodeIndexerPlan,           # decode indexer schedule shared by layers
         BatchDecodeIndexerQ8KV4Wrapper,   # Q8KV4 paged decode indexer (plan/run)
         BatchDecodeIndexerQ8KV8Wrapper,   # Q8KV8 paged decode indexer (plan/run)
         BatchPrefillIndexerQ8KV8Wrapper,  # Q8KV8 varlen prefill indexer (plan/run)
@@ -81,6 +82,7 @@ from fp4_indexer_interface import fp4_indexer_block_scores  # noqa: E402
 # Q8KV4/Q8KV8 paged indexers over the vLLM index-K cache, with fused TopK
 # (cute/q8_indexer_interface.py).
 from q8_indexer_interface import (  # noqa: E402
+    BatchDecodeIndexerPlan,
     BatchDecodeIndexerQ8KV4Wrapper,
     BatchDecodeIndexerQ8KV8Wrapper,
     BatchPrefillIndexerQ8KV8Wrapper,
@@ -115,6 +117,7 @@ __all__ = [
     "SparseDecodePagedAttentionWrapper",
     # indexing / CSR
     "fp4_indexer_block_scores",
+    "BatchDecodeIndexerPlan",
     "BatchDecodeIndexerQ8KV4Wrapper",
     "BatchDecodeIndexerQ8KV8Wrapper",
     "BatchPrefillIndexerQ8KV8Wrapper",

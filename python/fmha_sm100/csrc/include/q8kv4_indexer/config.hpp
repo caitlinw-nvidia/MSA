@@ -17,27 +17,27 @@
 
 namespace q8kv4_indexer {
 
-template <class Traits, int SchedulerCounterOffset> struct IndexerGemmConfig {
+template <class Traits> struct IndexerGemmConfig {
   using Params = IndexerGemmParams;
 
   struct alignas(1024) SharedStorage {
     uint8_t pages[Traits::kMaxPagesPerCta][Traits::kPageBytes];
-    alignas(16) float page_partials[Traits::kPartialPageCapacity][Traits::kPartialQueryCapacity]
-                                   [Traits::kPartialWarpCapacity];
-    uint8_t q_tile[Traits::kQueryLength * Traits::kHeadDim];
-    // Only the FP16 dequant path stages query fragments, but the layout stays
-    // target-independent because the host sizes dynamic SMEM without device
-    // feature macros.
-    uint4 query_fragments[4][cutlass::NumThreadsPerWarp];
+    uint64_t dequantized_ready[Traits::kDequantStages];
+    uint64_t mma_done[Traits::kAccumulatorStages];
+    uint32_t tmem_base;
+    alignas(1024) uint8_t q_tile[Traits::kQueryColumns * Traits::kHeadDim];
+    float query_maxima[Traits::kConsumerGroups][Traits::kConsumerWarpsPerGroup]
+                      [Traits::kQueryColumns];
     uint64_t page_barriers[Traits::kMaxPagesPerCta];
     uint64_t page_consumed_barriers[Traits::kMaxPagesPerCta];
-    int32_t work_tile_id;
+    int32_t next_page;
+    int32_t worker_end;
     int32_t batch_idx;
-    int32_t work_tile_idx;
+    int32_t page_begin;
+    int32_t page_count;
   };
 
   static constexpr int kNamedBarrierId = 1;
-  static constexpr int kScoreThreads = Traits::kScoreWarps * cutlass::NumThreadsPerWarp;
 
   CUTE_DEVICE static uint32_t smem_address(void const *pointer) {
     return cute::cast_smem_ptr_to_uint(pointer);
@@ -59,47 +59,18 @@ template <class Traits, int SchedulerCounterOffset> struct IndexerGemmConfig {
     cutlass::arch::ClusterBarrier::wait(barrier, phase);
   }
 
-  CUTE_DEVICE static void score_barrier() {
-    asm volatile("bar.sync %0, %1;" : : "r"(kNamedBarrierId), "r"(kScoreThreads) : "memory");
-  }
-
 #if Q8KV4_INDEXER_HAS_QMUL4
   CUTE_DEVICE static uint32_t qmul4(uint16_t packed, uint32_t broadcast_scale) {
-    return ::q8kv4_indexer::detail::nvfp4_to_e4m3x4(packed, broadcast_scale);
+    return detail::nvfp4_to_e4m3x4(packed, broadcast_scale);
   }
-#endif
-
-  CUTE_DEVICE static void convert_e4m3x4_to_f16x2(uint32_t value, uint32_t &low, uint32_t &high) {
-    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(low) : "h"(static_cast<uint16_t>(value)));
-    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;"
-                 : "=r"(high)
-                 : "h"(static_cast<uint16_t>(value >> 16)));
-  }
-
-#if !Q8KV4_INDEXER_HAS_QMUL4
+#else
   CUTE_DEVICE static void dequantize_fp4x8(uint32_t &output0, uint32_t &output1, uint32_t &output2,
                                            uint32_t &output3, uint32_t packed,
                                            uint32_t broadcast_scale) {
-    ::q8kv4_indexer::detail::nvfp4x8_to_f16x2x4(output0, output1, output2, output3, packed,
-                                                static_cast<uint16_t>(broadcast_scale));
+    detail::nvfp4x8_to_f16x2x4(output0, output1, output2, output3, packed,
+                               static_cast<uint16_t>(broadcast_scale));
   }
 #endif
-
-  CUTE_DEVICE static void hmma_f16(float (&accumulator)[4], uint32_t const (&matrix)[4],
-                                   uint2 query) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(accumulator[0]), "+f"(accumulator[1]), "+f"(accumulator[2]),
-                   "+f"(accumulator[3])
-                 : "r"(matrix[0]), "r"(matrix[1]), "r"(matrix[2]), "r"(matrix[3]), "r"(query.x),
-                   "r"(query.y));
-  }
-
-  CUTE_DEVICE static void load_matrix_x4(uint32_t (&matrix)[4], uint32_t address) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(matrix[0]), "=r"(matrix[1]), "=r"(matrix[2]), "=r"(matrix[3])
-                 : "r"(address));
-  }
 
   CUTE_DEVICE static int swizzled_page_offset(int token, int quarter) {
     return (token >> 1) * 128 + ((((token & 1) * 4 + quarter) ^ ((token >> 1) & 7)) * 16);
@@ -110,6 +81,8 @@ template <class Traits, int SchedulerCounterOffset> struct IndexerGemmConfig {
     return __byte_perm(word, 0, (index & 3) * 0x1111);
   }
 
+  // One page is two TMA transfers into one shared-memory slot: the packed values, then the
+  // scales. Both descriptors carry the cache page stride, so padded vLLM pages work as-is.
   CUTE_DEVICE static void issue_page_load(Params const &params, SharedStorage &storage, int slot,
                                           int physical_page) {
     uint64_t *barrier = storage.page_barriers + slot;
@@ -133,41 +106,31 @@ template <class Traits, int SchedulerCounterOffset> struct IndexerGemmConfig {
                  : "memory");
   }
 
-  CUTE_DEVICE static void claim_work(Params const &params, SharedStorage &storage) {
-    int const work_tile_id = atomicAdd(params.scheduler_workspace_ptr + SchedulerCounterOffset, 1);
-    storage.work_tile_id = work_tile_id;
-    int const work_count = params.scheduler_workspace_ptr[params.batch];
-    if (work_tile_id >= work_count) {
+  // Advance to the next span of this worker's pages; a span ends at a request or worker
+  // boundary because the UMMA consumers store scores directly.
+  CUTE_DEVICE static void next_work(Params const &params, SharedStorage &storage) {
+    int const begin = storage.next_page;
+    storage.page_count = 0;
+    if (begin >= storage.worker_end) {
       return;
     }
-    int permuted_work_tile_id = work_tile_id;
-    if (work_count > 1) {
-      int const permutation_bits = 32 - __clz(work_count - 1);
-      int const candidate =
-          static_cast<int>(__brev(static_cast<uint32_t>(work_tile_id)) >> (32 - permutation_bits));
-      if (candidate < work_count) {
-        permuted_work_tile_id = candidate;
-      }
+    while (params.scheduler_workspace_ptr[storage.batch_idx + 1] <= begin) {
+      ++storage.batch_idx;
     }
-    int lower = 0;
-    int upper = params.batch;
-    while (lower + 1 < upper) {
-      int const middle = (lower + upper) >> 1;
-      if (params.scheduler_workspace_ptr[middle] <= permuted_work_tile_id) {
-        lower = middle;
-      } else {
-        upper = middle;
-      }
-    }
-    storage.batch_idx = lower;
-    storage.work_tile_idx = permuted_work_tile_id - params.scheduler_workspace_ptr[lower];
+    storage.page_begin = begin - params.scheduler_workspace_ptr[storage.batch_idx];
+    int const end = min(storage.worker_end, params.scheduler_workspace_ptr[storage.batch_idx + 1]);
+    storage.page_count = end - begin;
+    storage.next_page = begin + storage.page_count;
   }
 
-  CUTE_DEVICE static float fold_page_score(SharedStorage const &storage, int page, int row) {
-    float4 const first = *reinterpret_cast<float4 const *>(&storage.page_partials[page][row][0]);
-    float4 const second = *reinterpret_cast<float4 const *>(&storage.page_partials[page][row][4]);
-    return fmaxf(fmaxf(fmaxf(first.x, first.y), fmaxf(first.z, first.w)),
-                 fmaxf(fmaxf(second.x, second.y), fmaxf(second.z, second.w)));
+  CUTE_DEVICE static void initialize_work(Params const &params, SharedStorage &storage) {
+    int const worker = int(blockIdx.x);
+    int32_t const *boundaries = params.scheduler_workspace_ptr + params.batch + 1;
+    storage.next_page = boundaries[worker];
+    storage.worker_end = boundaries[worker + 1];
+    int32_t const *start = params.scheduler_workspace_ptr + params.batch + params.sm_count + 2;
+    storage.batch_idx = start[worker];
+    next_work(params, storage);
   }
 };
 

@@ -481,8 +481,31 @@ topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 4, 16] int32
   `run()` when capturing. Prefill supports `replan()` after in-place metadata
   updates and must be warmed up before capture.
 - Batch size, page counts, and lengths never trigger recompilation.
-- A caller-owned decode `workspace_buffer` needs at least
-  `workspace_size(batch_size, num_heads=num_heads)` bytes.
+- A decode step's schedule is one `BatchDecodeIndexerPlan` kernel launch. It
+  snapshots `seq_lens` and writes the page prefix sum, an even split of the
+  pages over one worker per SM, and every (token, head) row's candidate count.
+  A decode wrapper owns and updates its own plan in `plan()`. Several wrappers
+  bound to the same `seq_lens` buffer, `max_blocks`, and `num_heads`, including
+  Q8KV8 and Q8KV4 wrappers, can share one plan:
+
+  ```python
+  from fmha_sm100 import BatchDecodeIndexerPlan
+
+  plan = BatchDecodeIndexerPlan(seq_lens_buffer, max_pages=max_blocks, num_heads=4)
+  for wrapper in decode_wrappers:
+      wrapper.plan(block_table_buffer, seq_lens_buffer, shared_plan=plan)
+  plan.update()                                      # once per step; may be graph-captured
+  ```
+
+  `plan.update()` allocates, compiles, and synchronizes nothing, so it can run
+  inside a captured CUDA Graph ahead of the wrappers' `run()`.
+- A caller-owned decode `workspace_buffer` holds the wrapper's plan and needs at
+  least `workspace_size(batch_size, num_heads=num_heads)` bytes; the size depends
+  on the device's SM count. Wrappers given a `shared_plan` must not own one.
+- One-head Q8KV4 decode runs a CUTLASS C++ kernel on the SM100 TMEM-source FP8
+  MMA with one persistent CTA per SM; two and four heads run the CuTe DSL
+  kernel. Q8KV4 decode wrappers launch the TopK select on a packed grid, four
+  short rows per CTA; the result is bit-identical to the one-CTA-per-row grid.
 - The Q8KV4 kernels use the public QMUL4 instruction when built with CUDA
   13.4 or newer and otherwise the exact FP16 dequantization path; both give
   identical results.

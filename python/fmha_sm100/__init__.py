@@ -25,6 +25,7 @@ _SPARSE_LAZY_EXPORTS = frozenset(
         "sparse_decode_atten_func",
         "SparseDecodePagedAttentionWrapper",
         "fp4_indexer_block_scores",
+        "BatchDecodeIndexerPlan",
         "BatchDecodeIndexerQ8KV4Wrapper",
         "BatchDecodeIndexerQ8KV8Wrapper",
         "BatchPrefillIndexerQ8KV8Wrapper",

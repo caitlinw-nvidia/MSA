@@ -134,3 +134,35 @@ python benchmarks/bench_sparse_attention_ops.py --dtype nvfp4 \
 The October 2 cluster run and its source snapshots were not modified by this
 local port. The canonical editable source is now the persistent cluster workspace
 `/home/scratch.caitlinw_coreai/msa-blackwell-port-correctness-20261004/MSA`.
+
+## Decode indexer port (`v1_MSA_blackwell_decode`)
+
+One commit on top of the prefill port ports nv_dev's Blackwell decode-indexer
+optimizations, pinned to MiniMax-AI/MSA nv_dev `9ae7751`. Provenance and
+adaptations are in `python/fmha_sm100/csrc/include/q8kv4_indexer/vendor_manifest.json`.
+The decode attention kernels are unchanged: dev's Q8KV4 decode attention is
+already ahead of nv_dev's, and nv_dev's FP8/BF16 decode attention is FlashInfer.
+
+| Change | Where | Effect |
+| --- | --- | --- |
+| Single-head Q8KV4 indexer on the SM100 TMEM-source FP8 MMA (tcgen05), one persistent CTA per SM | `csrc/include/q8kv4_indexer/*`, `csrc/q8kv4_indexer_decode.cu` | Replaces the `mma.sync` kernel; two and four heads keep dev's CuTe DSL tcgen05 kernel |
+| `BatchDecodeIndexerPlan`: one kernel builds a step's page prefix, per-SM work split, length snapshot and per-row candidate counts | `cute/src/sm100/decode_indexer_plan.py`, `cute/q8_indexer_interface.py` | Replaces dev's torch-op / CUB planning; graph-capturable; shareable by every decode wrapper of a step |
+| Compact TopK grid, `ceil(rows / 4)` CTAs for the warp family | `csrc/indexer_topk_select.cu` | Q8KV4 decode wrappers; bit-identical output |
+
+API: decode wrappers keep their constructors, `plan()` and `run()`. `plan()` gains
+an optional `shared_plan=`, `workspace_size()` gains an optional `device=` (the
+plan size depends on the SM count), and `BatchDecodeIndexerPlan` is exported from
+`fmha_sm100` and `fmha_sm100.sparse`. Scores, valid-page counts and TopK output
+stay token-major, as before.
+
+Not ported: query lengths other than eight, the BF16 decode indexer, and nv_dev's
+own Q8KV8/BF16 CuTe decode GEMM.
+
+Canonical editable source for this branch (Compute Lab, Santa Clara scratch):
+`/home/scratch.fkhoubsirat_coreai/caitlin-files/msa-v1-blackwell-decode-20261005/MSA`.
+
+Validation status: syntax checks only. No CUDA compilation, GPU correctness run
+or benchmark has been performed for this commit. Run
+`pytest -q python/fmha_sm100/cute/test_q8_indexer.py` on SM100/SM103; it covers the
+single-head kernel against the reference, shared plans across formats, a captured
+`plan.update()`, and compact-grid equivalence.
