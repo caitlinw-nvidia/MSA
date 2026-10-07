@@ -517,6 +517,109 @@ def test_decode_concurrent_streams_do_not_alias(fmt, num_heads):
         assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("num_heads", DECODE_HEADS["q8kv4"])
+@pytest.mark.parametrize("query_len", (1, 2, 4, 7))
+@pytest.mark.parametrize("batch,max_pages", [(1, 1), (5, 6), (129, 4)])
+def test_decode_short_queries_match_zero_padded(num_heads, query_len, batch, max_pages):
+    """Fewer than eight queries per request match the real rows of a zero-padded tile."""
+
+    seed = 100 * batch + 10 * query_len + num_heads
+    padded_q, k, block_table, seq_lens = _make_decode(
+        "q8kv4", batch, max_pages, seed, num_heads=num_heads
+    )
+    pad = MTP - query_len
+    tiles = padded_q.view(batch, MTP, num_heads, HEAD_DIM)
+    tiles[:, :pad] = torch.zeros((), device="cuda").to(torch.float8_e4m3fn)
+    q = tiles[:, pad:].reshape(batch * query_len, num_heads, HEAD_DIM).clone()
+
+    padded = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    padded.plan(block_table, seq_lens)
+    expected_scores = _run_decode_scores(padded, padded_q, k.cache).clone()
+    expected_topk = padded.run(padded_q, k.cache).view(batch, MTP, num_heads, TOP_K)
+
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    wrapper.plan(block_table, seq_lens, query_len=query_len)
+    real = slice(pad * num_heads, None)
+    scores = _run_decode_scores(wrapper, q, k.cache)
+    assert torch.equal(scores[:, real], expected_scores[:, real])
+    out = torch.full((batch * query_len, num_heads, TOP_K), -777, dtype=torch.int32, device="cuda")
+    topk = wrapper.run(q, k.cache, out=out)
+    assert topk.data_ptr() == out.data_ptr()
+    expected = expected_topk[:, pad:].reshape(batch * query_len, num_heads, TOP_K)
+    assert torch.equal(out, expected)
+    assert torch.equal(wrapper.run(q, k.cache), expected)
+
+
+def _one_head_work_counter(wrapper, batch: int) -> int:
+    """The one-head kernel's work counter: int32 129 of the workspace for the
+    inline scheduler (batch <= 128), int32 0 for the CUB-scan one."""
+
+    words = wrapper._workspace[: 130 * 4].view(torch.int32)
+    return int(words[129 if batch <= 128 else 0])
+
+
+@pytest.mark.parametrize("num_heads", DECODE_HEADS["q8kv4"])
+def test_decode_back_to_back_launches_of_one_plan(num_heads):
+    """A plan serves many layers in a row, eagerly and in a CUDA graph. The
+    one-head kernel's launches share a work counter that each must leave at
+    zero for the next; poisoned scores make a skipped work tile change the
+    top-k. Covers the inline (batch <= 128) and CUB-scan schedulers, a batch
+    without history pages and a short query length."""
+
+    layers = 60
+    # More than 16 pages, so the top-k depends on the scores.
+    cases = [
+        (1, 40, None, 8),
+        (128, 24, None, 8),
+        (129, 24, None, 1),
+        (1025, 20, None, 8),
+        # Every request inside its first page: no work tile at all.
+        (64, 2, torch.full((64,), 100, dtype=torch.int32, device="cuda"), 8),
+    ]
+    workspace = torch.empty(
+        BatchDecodeIndexerQ8KV4Wrapper.workspace_size(1025, num_heads=num_heads),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(workspace, num_heads=num_heads)
+    for seed, (batch, max_pages, seq_lens, query_len) in enumerate(cases):
+        padded_q, k, block_table, seq_lens = _make_decode(
+            "q8kv4", batch, max_pages, 500 + seed, num_heads=num_heads, seq_lens=seq_lens
+        )
+        q = padded_q.view(batch, MTP, num_heads, HEAD_DIM)[:, MTP - query_len :]
+        q = q.reshape(batch * query_len, num_heads, HEAD_DIM).contiguous()
+        wrapper.plan(block_table, seq_lens, query_len=query_len)
+        expected = wrapper.run(q, k.cache).clone()
+        outs = torch.empty(
+            (layers, *expected.shape), dtype=torch.int32, device="cuda"
+        )
+
+        def step():
+            for layer in range(layers):
+                wrapper._scores.fill_(POISON)
+                wrapper.run(q, k.cache, out=outs[layer])
+
+        def check():
+            assert all(torch.equal(out, expected) for out in outs)
+            # Each launch leaves the counter at zero, not only a correct result
+            # (a reset that comes too early repeats work and still gets it right).
+            if num_heads == 1:
+                assert _one_head_work_counter(wrapper, batch) == 0
+
+        for _ in range(3):
+            outs.fill_(-777)
+            _timed(f"q8kv4-h{num_heads}-b{batch}-{layers}-layers", step)
+            check()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            step()
+        for _ in range(5):
+            outs.fill_(-777)
+            _timed(f"q8kv4-h{num_heads}-b{batch}-graph", graph.replay)
+            check()
+
+
 def test_decode_compile_is_shape_independent_and_workspace_is_released():
     """Batch, page-table width, and lengths reuse one compiled kernel per format and heads."""
 
@@ -659,6 +762,15 @@ def test_decode_rejects_invalid_inputs(fmt):
         wrapper.run(q, k.cache.transpose(0, 1).contiguous().transpose(0, 1))
     with pytest.raises(ValueError, match="out must have shape"):
         wrapper.run(q, k.cache, out=torch.empty((4 * MTP, TOP_K), dtype=torch.int32, device="cuda"))
+    bad_query_lens = (0, 9, True) if fmt == "q8kv4" else (1, 7)
+    for query_len in bad_query_lens:
+        with pytest.raises(ValueError, match="supports query_len"):
+            wrapper.plan(block_table, seq_lens, query_len=query_len)
+    if fmt == "q8kv4":
+        wrapper.plan(block_table, seq_lens, query_len=2)
+        with pytest.raises(ValueError, match="q must have shape"):
+            wrapper.run(q, k.cache)
+        wrapper.plan(block_table, seq_lens)
     other = DECODE_FORMATS[1 - DECODE_FORMATS.index(fmt)]
     _, other_k, _, _ = _make_decode(other, 4, 3, 3)
     with pytest.raises((TypeError, ValueError)):
@@ -945,6 +1057,24 @@ def test_topk_select_contract(max_cols):
     baseline = out.clone()
     for _ in range(3):
         assert torch.equal(_topk_select(scores, lengths, out), baseline)
+
+
+def test_topk_select_strided_row_groups():
+    """A [groups, rows, cols] view ranks the same rows as their contiguous copy."""
+
+    generator = _generator(5)
+    groups, rows, skip, cols = 7, 3, 5, 300
+    full = torch.randn((groups, skip + rows + 2, cols + 9), generator=generator, device="cuda")
+    view = full[:, skip : skip + rows, :cols]
+    lengths = torch.randint(
+        1, cols + 1, (groups * rows,), generator=generator, device="cuda", dtype=torch.int32
+    )
+    out = torch.empty((groups * rows, TOP_K), dtype=torch.int32, device="cuda")
+    _topk_select(view, lengths, out)
+    expected = torch.empty_like(out)
+    _topk_select(view.reshape(groups * rows, cols).contiguous(), lengths, expected)
+    assert torch.equal(out, expected)
+    _assert_topk_contract(view.reshape(groups * rows, cols), lengths, out)
 
 
 def test_topk_select_exact_ties():

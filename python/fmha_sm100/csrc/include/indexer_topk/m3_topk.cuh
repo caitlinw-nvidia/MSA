@@ -86,9 +86,15 @@ __device__ __forceinline__ int row_nvm(const int* __restrict__ row_n,
   return 0;
 }
 
+// Row `row` of a [groups, rows_per_group, n_max] view: rows of a group lie
+// row_stride apart and groups group_stride apart (a matrix is one group).
 __device__ __forceinline__ const float* row_scores(
-    const float* __restrict__ scores, int row, int row_stride) {
-  return scores + static_cast<size_t>(row) * static_cast<size_t>(row_stride);
+    const float* __restrict__ scores, int row, int row_stride,
+    int rows_per_group, int64_t group_stride) {
+  const int group = row / rows_per_group;
+  const int group_row = row - group * rows_per_group;
+  return scores + static_cast<int64_t>(group) * group_stride +
+         static_cast<int64_t>(group_row) * row_stride;
 }
 
 // The 15 ranked ids, then the forced tail in the last slot.
@@ -195,12 +201,18 @@ inline int m3_rows_per_block(int n_max) {
 // block width rather than a warp path -- correct, just wider than it needs.
 __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
     const float* __restrict__ scores, const int* __restrict__ row_n,
-    int* __restrict__ out_ids, int n_max, int row_stride, int rows) {
+    int* __restrict__ out_ids, int n_max, int row_stride, int rows,
+    int rows_per_group, int64_t group_stride) {
   __shared__ union Smem {
     SelectSmem s;
     int sel[kRowsPerBlock][kSelK];
   } u;
   const int tid = static_cast<int>(threadIdx.x);
+  // With a PDL launch (decode) the predecessor writes the scores and may still
+  // read `out_ids`; every successor waits for this grid before reading
+  // `out_ids`. Both calls are no-ops for a plain launch.
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
 
   if (n_max - 1 <= kThreads) {
     // ---- warp family: one warp per row, no block barrier anywhere ----
@@ -216,7 +228,10 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
     const bool owns_row = (warp < kRowsPerBlock) && (row < rows);
     const int nvm = owns_row ? row_nvm(row_n, out_ids, row, lane) : 0;
     if (nvm > 0) {
-      warp_rank_row(nvm, row_scores(scores, row, row_stride), u.sel[warp]);
+      warp_rank_row(nvm,
+                    row_scores(scores, row, row_stride, rows_per_group,
+                               group_stride),
+                    u.sel[warp]);
       write_row(out_ids, row, lane, nvm, u.sel[warp]);
     }
   } else {
@@ -226,7 +241,10 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
     const int row = static_cast<int>(blockIdx.x);
     const int nvm = row_nvm(row_n, out_ids, row, tid);
     if (nvm > 0) {
-      block_rank_row<0>(nvm, row_scores(scores, row, row_stride), u.s);
+      block_rank_row<0>(nvm,
+                        row_scores(scores, row, row_stride, rows_per_group,
+                                   group_stride),
+                        u.s);
       write_row(out_ids, row, tid, nvm, u.s.sel_ids);
     }
   }
@@ -259,9 +277,19 @@ inline int m3_occ() {
 // +7 to +15% at 4096 rows, +31 to +45% at 8192. A caller working at that scale
 // wants the packed grid back.
 inline void m3_launch(const float* scores, const int* row_n, int* out, int n_max,
-                      int row_stride, int rows, cudaStream_t st) {
-  m3_topk_kernel<<<rows, kThreads, 0, st>>>(scores, row_n, out, n_max,
-                                            row_stride, rows);
+                      int row_stride, int rows, int rows_per_group,
+                      int64_t group_stride, cudaStream_t st, bool pdl = true) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(rows);
+  config.blockDim = dim3(kThreads);
+  config.stream = st;
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute.val.programmaticStreamSerializationAllowed = pdl;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  cudaLaunchKernelEx(&config, m3_topk_kernel, scores, row_n, out, n_max, row_stride,
+                     rows, rows_per_group, group_stride);
 }
 
 }  // namespace m3

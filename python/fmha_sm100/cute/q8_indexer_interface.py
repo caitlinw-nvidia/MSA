@@ -12,7 +12,8 @@ or 4 per rank) share the single index-K head and each head selects its own
 pages:
 
 * ``q``: ``[num_tokens, num_heads, 128]`` E4M3, token-major (decode tokens are
-  grouped per request, eight MTP tokens each).
+  grouped per request, eight MTP tokens each, or ``query_len`` for the Q8KV4
+  decode indexer).
 * Q8KV8 ``k_cache``: ``[num_blocks, 128, 128]`` E4M3.
 * Q8KV4 ``k_cache``: ``[num_blocks, 128, 72]`` uint8. Each page stores the packed
   E2M1 values of all 128 tokens (8192 bytes, 64 bytes per token, the low nibble
@@ -248,30 +249,37 @@ def bind_indexer_module_loader(loader) -> None:
     _indexer_module_loader = loader
 
 
-def _topk_select(scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+def _topk_select(
+    scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, *, use_pdl: bool = True
+) -> torch.Tensor:
     """Write 15 score-ranked pages and the forced local page for every row.
 
-    ``scores`` is ``[rows, max_pages]``; ``lengths[row]`` counts the row's
-    candidates including its local page, which lands in the last slot. Ranked
-    pages are score-descending with ties broken toward the lower page. Rows with
-    at most 16 candidates emit ``0 .. lengths[row] - 1`` followed by ``-1``.
+    ``scores`` is ``[rows, max_pages]``, or a ``[groups, rows_per_group,
+    max_pages]`` view (a strided subset of the rows), ranked in row order;
+    ``lengths[row]`` counts the row's candidates including its local page,
+    which lands in the last slot. Ranked pages are score-descending with ties
+    broken toward the lower page. Rows with at most 16 candidates emit
+    ``0 .. lengths[row] - 1`` followed by ``-1``. It launches with programmatic
+    dependent launch (it waits for the scores' producer on the device) unless
+    ``use_pdl`` is False.
     """
 
     _indexer_module_loader("indexer_topk_select").indexer_topk_select(
         scores,
         lengths,
-        out.view(scores.shape[0], _TOP_K),
+        out.view(lengths.shape[0], _TOP_K),
+        use_pdl,
         _stream_ptr(scores.device),
     )
     return out
 
 
-def _decode_num_valid_pages(seq_lens: torch.Tensor, max_pages: int, num_heads: int) -> torch.Tensor:
-    """Candidate pages per (MTP token, head) row, including the token's local page."""
+def _decode_num_valid_pages(
+    seq_lens: torch.Tensor, max_pages: int, num_heads: int, query_len: int = _DECODE_QUERY_LENGTH
+) -> torch.Tensor:
+    """Candidate pages per (query, head) row, including the query's local page."""
 
-    query_offsets = torch.arange(
-        -_DECODE_QUERY_LENGTH, 0, dtype=torch.int32, device=seq_lens.device
-    )
+    query_offsets = torch.arange(-query_len, 0, dtype=torch.int32, device=seq_lens.device)
     positions = seq_lens[:, None] + query_offsets[None, :]
     lengths = torch.div(positions, _PAGE_SIZE, rounding_mode="floor").add_(1)
     lengths.clamp_(min=1, max=max_pages)
@@ -287,6 +295,10 @@ class _BatchDecodeIndexerBase:
     are scored together, reading each K page once. A wrapper instance owns its
     workspace and buffers and must not be shared by concurrently running
     streams.
+
+    Wrappers with ``_supports_query_len`` also plan requests of fewer queries
+    (``query_len``): ``q`` and the output then hold only those, which take the
+    last ``query_len`` of the eight slots.
     """
 
     def __init__(
@@ -323,8 +335,10 @@ class _BatchDecodeIndexerBase:
         self._scores: torch.Tensor | None = None
         self._num_valid_pages: torch.Tensor | None = None
         self._topk_indices: torch.Tensor | None = None
+        self._query_len = _DECODE_QUERY_LENGTH
 
     _supported_num_heads = _SUPPORTED_NUM_HEADS
+    _supports_query_len = False
     _kernel_name: str
     _kernel_class: type
 
@@ -387,15 +401,33 @@ class _BatchDecodeIndexerBase:
             raise ValueError("seq_lens must have shape [batch]")
         _check_block_table(block_table, seq_lens.shape[0], seq_lens.device)
 
-    def plan(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
+    def plan(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        query_len: int = _DECODE_QUERY_LENGTH,
+    ) -> None:
         """Bind metadata and build the device schedule without host synchronization.
 
         Call outside CUDA Graph capture whenever ``seq_lens`` or the batch
         changes. In CUDA Graph mode the metadata is copied into the fixed
         constructor buffers, whose shapes are fixed for the wrapper lifetime.
+        ``query_len`` is the number of queries per request ``q`` holds.
         """
 
         self._check_metadata(block_table, seq_lens)
+        if query_len != _DECODE_QUERY_LENGTH and (
+            not self._supports_query_len
+            or isinstance(query_len, bool)
+            or not isinstance(query_len, int)
+            or not 1 <= query_len <= _DECODE_QUERY_LENGTH
+        ):
+            raise ValueError(
+                f"{type(self).__name__} supports query_len "
+                + ("in [1, 8]" if self._supports_query_len else "8")
+                + f", got {query_len!r}"
+            )
         device = block_table.device
         _require_supported_device(device)
         if _is_capturing(device):
@@ -423,14 +455,16 @@ class _BatchDecodeIndexerBase:
             self._workspace = torch.empty(required_bytes, dtype=torch.uint8, device=device)
         self._block_table = block_table
         self._seq_lens = seq_lens
+        self._query_len = query_len
         self._plan_scheduler(block_table, seq_lens)
 
-        tokens = batch_size * _DECODE_QUERY_LENGTH
+        tokens = batch_size * query_len
         score_shape = (batch_size, _DECODE_QUERY_LENGTH * self._num_heads, max_pages)
         if (
             self._scores is None
             or self._scores.shape != score_shape
             or self._scores.device != device
+            or self._topk_indices.shape[0] != tokens
         ):
             self._scores = torch.empty(score_shape, dtype=torch.float32, device=device)
             self._num_valid_pages = torch.empty(
@@ -439,7 +473,9 @@ class _BatchDecodeIndexerBase:
             self._topk_indices = torch.empty(
                 (tokens, self._num_heads, _TOP_K), dtype=torch.int32, device=device
             )
-        self._num_valid_pages.copy_(_decode_num_valid_pages(seq_lens, max_pages, self._num_heads))
+        self._num_valid_pages.copy_(
+            _decode_num_valid_pages(seq_lens, max_pages, self._num_heads, query_len)
+        )
 
     def _run_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> torch.Tensor:
         """Write historical page scores; the local page and later pages stay untouched."""
@@ -447,7 +483,7 @@ class _BatchDecodeIndexerBase:
         if self._scores is None:
             raise RuntimeError("plan() must be called before run()")
         device = self._scores.device
-        _check_query(q, self._topk_indices.shape[0], self._num_heads, device)
+        _check_query(q, self._scores.shape[0] * self._query_len, self._num_heads, device)
         self._check_k_cache(k_cache, device)
         self._launch_scores(q, k_cache)
         return self._scores
@@ -459,14 +495,16 @@ class _BatchDecodeIndexerBase:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return ``[batch * 8, num_heads, 16]`` logical page indices for one layer."""
+        """Return ``[batch * query_len, num_heads, 16]`` logical page indices for one layer."""
 
         scores = self._run_scores(q, k_cache)
         if out is None:
             out = self._topk_indices
         else:
             _check_topk_output(out, self._topk_indices.shape[0], self._num_heads, scores.device)
-        return _topk_select(scores.view(-1, scores.shape[-1]), self._num_valid_pages, out)
+        # The rows of the queries q holds, which fill the last slots of the eight.
+        query_rows = scores[:, (_DECODE_QUERY_LENGTH - self._query_len) * self._num_heads :]
+        return _topk_select(query_rows, self._num_valid_pages, out)
 
 
 class BatchDecodeIndexerQ8KV8Wrapper(_BatchDecodeIndexerBase):
@@ -493,7 +531,9 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
     positive and does not change the ranking, so it is not an input. One head
     runs the CUTLASS C++ kernel and two or four heads run the CuTe DSL kernel. Builds
     on CUDA 13.4 or newer use the public QMUL4 instruction on SM100/SM103, and
-    older ones select the exact FP16 dequantization.
+    older ones select the exact FP16 dequantization. Requests may carry fewer than
+    eight queries (``plan(..., query_len=n)``), so a caller needs no zero-padded
+    copy of its queries and gets ``[batch * n, num_heads, 16]`` back.
 
     Example::
 
@@ -503,6 +543,7 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
     """
 
     _supported_num_heads = (1, *Q8KV4DecodeIndexerSm100.supported_num_heads)
+    _supports_query_len = True
     _kernel_name = "q8kv4_indexer_decode_sm100"
     _kernel_class = Q8KV4DecodeIndexerSm100
 
@@ -753,7 +794,8 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             out = state.topk_indices
         else:
             _check_topk_output(out, state.total_q, state.num_heads, scores.device)
-        return _topk_select(scores, state.num_valid_pages, out)
+        # The prefill chain runs eagerly and is not PDL-chained.
+        return _topk_select(scores, state.num_valid_pages, out, use_pdl=False)
 
 
 __all__ = [

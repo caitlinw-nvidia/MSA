@@ -31,7 +31,8 @@ template <class Traits> struct IndexerGemmRunner {
     return arguments.q_ptr != nullptr && arguments.k_cache_ptr != nullptr &&
            arguments.page_table_ptr != nullptr && arguments.kv_lengths_ptr != nullptr &&
            arguments.scheduler_workspace_ptr != nullptr && arguments.output_ptr != nullptr &&
-           arguments.batch > 0 && arguments.max_pages > 0 &&
+           arguments.batch > 0 && arguments.query_length > 0 &&
+           arguments.query_length <= Traits::kQueryLength && arguments.max_pages > 0 &&
            arguments.max_pages <= Traits::kMaximumPages && arguments.physical_pages > 0 &&
            arguments.page_stride_bytes >= Traits::kPageBytes &&
            arguments.page_stride_bytes % 16 == 0 && arguments.sm_count > 0;
@@ -75,6 +76,7 @@ template <class Traits> struct IndexerGemmRunner {
       return status;
     }
     params.q_ptr = static_cast<uint8_t const *>(arguments.q_ptr);
+    params.query_length = arguments.query_length;
     params.output_ptr = arguments.output_ptr;
     params.sm_count = arguments.sm_count;
 
@@ -147,27 +149,21 @@ template <class Traits> struct IndexerGemmRunner {
   }
 
   static cudaError_t run(IndexerGemmParams const &params, cudaStream_t stream) {
-    int const counter_offset =
-        params.batch <= Traits::kPrepareThreads ? kInlineCounterOffset : kDynamicCounterOffset;
-    reset_indexer_gemm_scheduler_counter<<<1, 1, 0, stream>>>(params.scheduler_workspace_ptr +
-                                                              counter_offset);
-    cudaError_t status = cudaGetLastError();
-    if (status != cudaSuccess) {
-      return status;
-    }
     dim3 const grid(params.sm_count * 4, 1, 1);
-    cudaLaunchAttribute attributes[1]{};
+    cudaLaunchAttribute attributes[2]{};
     attributes[0].id = cudaLaunchAttributeClusterDimension;
     attributes[0].val.clusterDim.x = 1;
     attributes[0].val.clusterDim.y = 1;
     attributes[0].val.clusterDim.z = 1;
+    attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[1].val.programmaticStreamSerializationAllowed = 1;
     cudaLaunchConfig_t launch_config{};
     launch_config.gridDim = grid;
     launch_config.blockDim = dim3(InlineKernel::kThreadCount, 1, 1);
     launch_config.dynamicSmemBytes = InlineKernel::kSharedStorageBytes;
     launch_config.stream = stream;
     launch_config.attrs = attributes;
-    launch_config.numAttrs = 1;
+    launch_config.numAttrs = 2;
     cudaError_t const launch_status =
         params.batch <= Traits::kPrepareThreads
             ? cudaLaunchKernelEx(&launch_config, indexer_gemm_kernel<Traits, kInlineCounterOffset>,

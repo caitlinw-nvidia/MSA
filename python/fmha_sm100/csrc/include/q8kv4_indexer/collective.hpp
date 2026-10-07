@@ -50,6 +50,12 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
     int const warp_idx = thread_idx / cutlass::NumThreadsPerWarp;
     int const lane_idx = thread_idx % cutlass::NumThreadsPerWarp;
 
+    // Claim before the PDL wait. Only this kernel touches the counter, and the
+    // previous launch has finished: this grid launches once its predecessor
+    // triggers, and every kernel in between waits for its own predecessor
+    // first. Claims made as CTAs arrive spread the work tiles over the SMs;
+    // claiming after the wait sent every resident CTA to the counter at once
+    // and made a one-request 128k decode ~2 us slower.
     if (thread_idx == 0) {
       claim_work(params, storage);
     }
@@ -60,13 +66,18 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
       init_barrier(storage.page_consumed_barriers + thread_idx - Traits::kMaxPagesPerCta - 1,
                    Traits::kScoreWarps);
     }
-
     cutlass::arch::fence_barrier_init();
+
+    // PDL: the predecessor writes q and the current pages of the index cache.
+    cudaGridDependencySynchronize();
     __syncthreads();
 
     int page_ticket_base = 0;
     while (true) {
       if (storage.work_tile_id >= params.scheduler_workspace_ptr[params.batch]) {
+        // The CTA's last scores are stored. The top-k that reads them waits for
+        // this grid, so it may start launching now.
+        cudaTriggerProgrammaticLaunchCompletion();
         break;
       }
       int const batch_idx = storage.batch_idx;
@@ -82,10 +93,19 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
           params.page_table_ptr + static_cast<size_t>(batch_idx) * params.max_pages;
 
       if (local_pages > 0 && thread_idx < (Traits::kQueryLength * Traits::kHeadDim) / 16) {
-        size_t const query_offset =
-            static_cast<size_t>(batch_idx) * Traits::kQueryLength * Traits::kHeadDim;
-        reinterpret_cast<uint4 *>(storage.q_tile)[thread_idx] =
-            reinterpret_cast<uint4 const *>(params.q_ptr + query_offset)[thread_idx];
+        // A request's query_length queries take the last slots of the tile;
+        // the leading slots score zeros and are never read back.
+        constexpr int kChunksPerQuery = Traits::kHeadDim / 16;
+        int const slot =
+            thread_idx / kChunksPerQuery - (Traits::kQueryLength - params.query_length);
+        uint4 chunk = make_uint4(0u, 0u, 0u, 0u);
+        if (slot >= 0) {
+          size_t const query_offset =
+              (static_cast<size_t>(batch_idx) * params.query_length + slot) * Traits::kHeadDim;
+          chunk = reinterpret_cast<uint4 const *>(params.q_ptr + query_offset)[thread_idx %
+                                                                               kChunksPerQuery];
+        }
+        reinterpret_cast<uint4 *>(storage.q_tile)[thread_idx] = chunk;
       }
 
       int const initial_pages = min(local_pages, Traits::kMaxPagesPerCta);
@@ -280,6 +300,14 @@ struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset>
 
       page_ticket_base += local_pages;
       __syncthreads();
+    }
+
+    // Every CTA claims until its first claim past the work count, so a launch
+    // makes exactly work_count + gridDim.x claims. The CTA that made the last
+    // one resets the counter for the next launch, which needs no reset kernel.
+    if (thread_idx == 0 && storage.work_tile_id == params.scheduler_workspace_ptr[params.batch] +
+                                                       static_cast<int>(gridDim.x) - 1) {
+      params.scheduler_workspace_ptr[SchedulerCounterOffset] = 0;
     }
   }
 };
