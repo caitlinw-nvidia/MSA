@@ -340,6 +340,29 @@ def test_decode_matches_reference(fmt, num_heads, batch, max_pages, page_pad, q_
         assert torch.equal(wrapper.run(q, k.cache), topk)
 
 
+@pytest.mark.parametrize("num_heads", (1, 2, 4))
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        (8, 8, 8, 8),
+        (8, 129, 8, 129),
+        (4097, 8, 264, 129),
+    ],
+)
+def test_q8kv8_decode_worker_boundaries(num_heads, lengths):
+    """Prefix-only scheduling handles idle workers, empty requests and skew."""
+    q, k, block_table, seq_lens = _make_decode(
+        "q8kv8", 4, 33, 781, num_heads=num_heads, page_pad=256
+    )
+    seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
+    wrapper = BatchDecodeIndexerQ8KV8Wrapper(num_heads=num_heads)
+    wrapper.plan(block_table, seq_lens)
+    scores = _run_decode_scores(wrapper, q, k.cache)
+    _assert_decode_scores(scores, _decode_reference(q, k, block_table), seq_lens)
+    indices = wrapper.run(q, k.cache)
+    _assert_topk_contract(scores, _decode_valid_pages(seq_lens, num_heads), indices)
+
+
 @pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
 def test_decode_long_context_upper_bound(fmt, num_heads):
     """1M-token rows at the 8192-page table limit next to short rows."""
