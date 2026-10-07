@@ -3,283 +3,327 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include <cmath>
 
-#include <cstddef>
-#include <cstdint>
-#include <type_traits>
-
+#include "cute/arch/copy_sm100.hpp"
+#include "cute/arch/tmem_allocator_sm100.hpp"
+#include "cute/atom/mma_traits_sm100.hpp"
+#include "cute/tensor.hpp"
 #include "q8kv4_indexer/config.hpp"
 
 namespace q8kv4_indexer {
 
-template <class Traits, int SchedulerCounterOffset>
-struct IndexerGemmCollective : IndexerGemmConfig<Traits, SchedulerCounterOffset> {
-  using Base = IndexerGemmConfig<Traits, SchedulerCounterOffset>;
-  using Base::arrive;
-  using Base::broadcast_scale_byte;
-  using Base::claim_work;
-  using Base::convert_e4m3x4_to_f16x2;
+template <class Traits> struct IndexerGemmUmmaCollective : IndexerGemmConfig<Traits> {
+  using Base = IndexerGemmConfig<Traits>;
   using typename Base::Params;
   using typename Base::SharedStorage;
-#if !Q8KV4_INDEXER_HAS_QMUL4
-  using Base::dequantize_fp4x8;
-#endif
-  using Base::fold_page_score;
-  using Base::hmma_f16;
-  using Base::init_barrier;
-  using Base::issue_page_load;
-  using Base::load_matrix_x4;
-#if Q8KV4_INDEXER_HAS_QMUL4
-  using Base::qmul4;
-#endif
-  using Base::score_barrier;
-  using Base::smem_address;
-  using Base::swizzled_page_offset;
-  using Base::wait;
+  using Element = cutlass::float_e4m3_t;
+  using Mma = cute::SM100_MMA_F8F6F4_TS<Element, Element, float, 128, Traits::kQueryColumns,
+                                        cute::UMMA::Major::K, cute::UMMA::Major::K>;
+  static constexpr int kDequantWarps = Traits::kDequantWarpsPerGroup;
+  static constexpr int kDequantGroups = Traits::kDequantGroups;
+  static constexpr int kConsumerWarps = Traits::kConsumerWarpsPerGroup;
+  static constexpr int kConsumerGroups = Traits::kConsumerGroups;
+  static constexpr int kDequantStages = Traits::kDequantStages;
+  static_assert(kDequantStages % kDequantGroups == 0);
+  // Each page worker observes every generation of its packed and TMEM slots.
+  static_assert(Traits::kMaxPagesPerCta % Traits::kPageWorkerGroups == 0);
+  static constexpr int kAccumulatorStages = Traits::kAccumulatorStages;
+  static_assert(kDequantStages == kAccumulatorStages);
+  static_assert(kDequantGroups == kConsumerGroups);
+  static_assert(kDequantWarps == kConsumerWarps);
+  static constexpr int kOperandColumns = Traits::kHeadDim / sizeof(uint32_t);
+  static constexpr int kTmemColumnBudget = 512;
+  static_assert(kAccumulatorStages == kConsumerGroups);
+  static constexpr int kAccumulatorColumns = Traits::kQueryColumns * kAccumulatorStages;
+  static constexpr int kRequiredTmemColumns =
+      kAccumulatorColumns + kDequantStages * kOperandColumns;
+  static_assert(kRequiredTmemColumns <= kTmemColumnBudget);
+  static constexpr int kTmemColumns =
+      kRequiredTmemColumns <= 128 ? 128 : (kRequiredTmemColumns <= 256 ? 256 : 512);
 
-  struct PageFragments {
-    uint32_t matrix_a[4];
-    uint32_t matrix_b[4];
-    uint2 scale_a;
-    uint2 scale_b;
-  };
+  CUTE_DEVICE static uint32_t operand_address(uint32_t tmem_base, int slot) {
+    return tmem_base + kAccumulatorColumns + slot * kOperandColumns;
+  }
+  static constexpr int kMmaWarp = Traits::kPageWorkerGroups * Traits::kPageWorkerWarps;
+  static constexpr int kTransportWarp = kMmaWarp + 1;
+
+  CUTE_DEVICE static uint32_t accumulator_address(uint32_t tmem_base, int slot) {
+    // Token-major pages occupy adjacent groups of query columns.
+    return tmem_base + uint32_t(slot * Traits::kQueryColumns);
+  }
+
+  CUTE_DEVICE static int fp8_offset(int row, int column) {
+    return row * Traits::kHeadDim + (column ^ ((row & 7) * 16));
+  }
+
+  CUTE_DEVICE static uint2 dequantize_word(uint32_t packed, uint32_t scale) {
+#if Q8KV4_INDEXER_HAS_QMUL4
+    return {Base::qmul4(static_cast<uint16_t>(packed), scale),
+            Base::qmul4(static_cast<uint16_t>(packed >> 16), scale)};
+#else
+    uint32_t half[4];
+    Base::dequantize_fp4x8(half[0], half[1], half[2], half[3], packed, scale);
+    uint16_t fp8[4];
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < 4; ++i) {
+      asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(fp8[i]) : "r"(half[i]));
+    }
+    return {uint32_t(fp8[0]) | (uint32_t(fp8[1]) << 16),
+            uint32_t(fp8[2]) | (uint32_t(fp8[3]) << 16)};
+#endif
+  }
+
+  CUTE_DEVICE static void dequantize_page(SharedStorage &storage, int page_slot, int dequant_slot,
+                                          int thread_idx, uint32_t tmem_base) {
+    constexpr int kQuarters = Traits::kHeadDim / 32;
+    int const token = thread_idx;
+    uint8_t const *page = storage.pages[page_slot];
+    uint4 packed_fragments[kQuarters];
+    CUTLASS_PRAGMA_UNROLL
+    for (int quarter = 0; quarter < kQuarters; ++quarter) {
+      packed_fragments[quarter] =
+          *reinterpret_cast<uint4 const *>(page + Base::swizzled_page_offset(token, quarter));
+    }
+    uint2 const scales = *reinterpret_cast<uint2 const *>(page + Traits::kPackedKBytes +
+                                                          token * Traits::kScaleGroups);
+    __syncwarp();
+    if (cute::elect_one_sync()) {
+      Base::arrive(storage.page_consumed_barriers + page_slot);
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int quarter = 0; quarter < kQuarters; ++quarter) {
+      uint4 const packed = packed_fragments[quarter];
+      uint32_t const scale0 = Base::broadcast_scale_byte(scales, 2 * quarter);
+      uint32_t const scale1 = Base::broadcast_scale_byte(scales, 2 * quarter + 1);
+      uint2 const v0 = dequantize_word(packed.x, scale0);
+      uint2 const v1 = dequantize_word(packed.y, scale0);
+      uint2 const v2 = dequantize_word(packed.z, scale1);
+      uint2 const v3 = dequantize_word(packed.w, scale1);
+      // Every warp writes only its own 32 datapaths; four FP8 values share a column.
+      uint32_t const address = operand_address(tmem_base, dequant_slot) + quarter * 8 +
+                               (uint32_t((thread_idx / 32) * 32) << 16);
+      cute::SM100_TMEM_STORE_32dp32b8x::copy(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y,
+                                             address);
+    }
+  }
+
+  CUTE_DEVICE static void issue_mma(SharedStorage &storage, int slot, int accumulator_slot,
+                                    uint32_t tmem_base) {
+    auto const q_layout =
+        cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<Element>{},
+                            cute::make_shape(cute::Int<Traits::kQueryColumns>{}, cute::_128{}));
+    auto sQ = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<Element *>(storage.q_tile)),
+                                q_layout);
+    auto desc_q = cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(sQ);
+    auto const descriptor =
+        cute::UMMA::make_instr_desc<Element, Element, float, 128, Traits::kQueryColumns,
+                                    cute::UMMA::Major::K, cute::UMMA::Major::K>();
+    uint64_t const instruction = cute::UMMA::make_runtime_instr_desc<>(descriptor);
+    // Both TMEM locations remain fixed while issuing the four K fragments.
+    uint32_t const operand_base = operand_address(tmem_base, slot);
+    uint32_t const accumulator_base = accumulator_address(tmem_base, accumulator_slot);
+    CUTLASS_PRAGMA_UNROLL
+    for (int k = 0; k < Traits::kHeadDim / 32; ++k) {
+      uint32_t const tmem_k = operand_base + k * 8;
+      Mma::fma(tmem_k, desc_q, accumulator_base, k != 0, instruction);
+      desc_q.start_address_ += 2;
+    }
+  }
+
+  CUTE_DEVICE static void reduce_page(Params const &params, SharedStorage &storage, int batch_idx,
+                                      int logical_page, int kv_length, int consumer_warp,
+                                      int lane_idx, int accumulator_slot, int consumer_group,
+                                      uint32_t tmem_base) {
+    constexpr int kReductionColumns = 8;
+    uint32_t const page_address =
+        accumulator_address(tmem_base, accumulator_slot) + (uint32_t(consumer_warp * 32) << 16);
+    CUTLASS_PRAGMA_UNROLL
+    for (int group = 0; group < Traits::kQueryColumns / kReductionColumns; ++group) {
+      if (group * kReductionColumns < params.query_length * Traits::kNumIndexHeads) {
+        uint32_t const address = page_address + group * kReductionColumns;
+        uint32_t values[kReductionColumns];
+        cute::SM100_TMEM_LOAD_32dp32b8x::copy(address, values[0], values[1], values[2], values[3],
+                                              values[4], values[5], values[6], values[7]);
+        cutlass::arch::fence_view_async_tmem_load();
+        CUTLASS_PRAGMA_UNROLL
+        for (int column = 0; column < kReductionColumns; ++column) {
+          float maximum = __uint_as_float(values[column]);
+          // All lanes participate; only wholly invalid query groups are skipped.
+          asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(maximum) : "f"(maximum));
+          values[column] = __float_as_uint(maximum);
+        }
+        if (lane_idx == 0) {
+          // Publish each contiguous eight-column partial with two vector stores.
+          auto *partials = reinterpret_cast<uint4 *>(
+              &storage.query_maxima[consumer_group][consumer_warp][group * kReductionColumns]);
+          partials[0] = uint4{values[0], values[1], values[2], values[3]};
+          partials[1] = uint4{values[4], values[5], values[6], values[7]};
+        }
+      }
+    }
+    // The next operand-ready notification also orders these accumulator reads.
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    // Each warp owns 32 TMEM rows; combine their page partials after publication.
+    asm volatile("bar.sync %0, %1;"
+                 :
+                 : "r"(Base::kNamedBarrierId + consumer_group),
+                   "r"(kConsumerWarps * cutlass::NumThreadsPerWarp)
+                 : "memory");
+    int const column = consumer_warp * cutlass::NumThreadsPerWarp + lane_idx;
+    if (column < params.query_length * Traits::kNumIndexHeads) {
+      int const query = column / Traits::kNumIndexHeads;
+      int const head = column % Traits::kNumIndexHeads;
+      int const page = logical_page;
+      int const local_page = (kv_length - params.query_length + query) / Traits::kPageTokens;
+      if (page < local_page) {
+        // dev keeps token-major scores, [batch, Q * H, max_pages], matching the TopK rows.
+        size_t const row =
+            (size_t(batch_idx) * params.query_length + query) * Traits::kNumIndexHeads + head;
+        float maximum = storage.query_maxima[consumer_group][0][column];
+        CUTLASS_PRAGMA_UNROLL
+        for (int partial = 1; partial < kConsumerWarps; ++partial) {
+          maximum = fmaxf(maximum, storage.query_maxima[consumer_group][partial][column]);
+        }
+        params.output_ptr[row * params.max_pages + page] = maximum;
+      }
+    }
+    // The next operand-ready waits for all four warps to finish these reads.
+    // Its MMA completion therefore orders the next overwrite of this scratch.
+  }
 
   CUTE_DEVICE static void run(Params const &params, SharedStorage &storage) {
-    int const thread_idx = static_cast<int>(threadIdx.x);
-    int const warp_idx = thread_idx / cutlass::NumThreadsPerWarp;
-    int const lane_idx = thread_idx % cutlass::NumThreadsPerWarp;
-
-    if (thread_idx == 0) {
-      claim_work(params, storage);
+    int const thread_idx = int(threadIdx.x);
+    int const warp_idx = thread_idx / 32;
+    int const lane_idx = thread_idx % 32;
+    // Work metadata is independent of barrier setup and TMEM allocation.
+    if (thread_idx == kTransportWarp * cutlass::NumThreadsPerWarp) {
+      Base::initialize_work(params, storage);
+      for (int slot = 0; slot < Traits::kMaxPagesPerCta; ++slot) {
+        Base::init_barrier(storage.page_barriers + slot, 1);
+      }
     }
-    if (thread_idx >= 1 && thread_idx <= Traits::kMaxPagesPerCta) {
-      init_barrier(storage.page_barriers + thread_idx - 1, 1);
+    // Separate barrier setup from warp 0 TMEM allocation before the CTA fence.
+    if (thread_idx == kMmaWarp * cutlass::NumThreadsPerWarp) {
+      for (int slot = 0; slot < kAccumulatorStages; ++slot) {
+        Base::init_barrier(storage.mma_done + slot, 1);
+      }
+      for (int slot = 0; slot < Traits::kMaxPagesPerCta; ++slot) {
+        Base::init_barrier(storage.page_consumed_barriers + slot, kDequantWarps);
+      }
+      for (int slot = 0; slot < kDequantStages; ++slot) {
+        Base::init_barrier(storage.dequantized_ready + slot, kDequantWarps);
+      }
     }
-    if (thread_idx > Traits::kMaxPagesPerCta && thread_idx <= 2 * Traits::kMaxPagesPerCta) {
-      init_barrier(storage.page_consumed_barriers + thread_idx - Traits::kMaxPagesPerCta - 1,
-                   Traits::kScoreWarps);
+    if (warp_idx == 0) {
+      cute::TMEM::Allocator1Sm allocator;
+      allocator.allocate(kTmemColumns, &storage.tmem_base);
+      allocator.release_allocation_lock();
     }
-
     cutlass::arch::fence_barrier_init();
+    if (warp_idx == kTransportWarp) {
+      // Publish this warp's metadata and barrier initialization before first-page TMA.
+      __syncwarp();
+      if (lane_idx < min(storage.page_count, Traits::kMaxPagesPerCta)) {
+        int32_t const *table = params.page_table_ptr + size_t(storage.batch_idx) * params.max_pages;
+        Base::issue_page_load(params, storage, lane_idx,
+                              __ldg(table + storage.page_begin + lane_idx));
+      }
+    }
     __syncthreads();
-
-    int page_ticket_base = 0;
-    while (true) {
-      if (storage.work_tile_id >= params.scheduler_workspace_ptr[params.batch]) {
-        break;
-      }
+    // Allocation is published above and remains unchanged until the final deallocation.
+    uint32_t const tmem_base = storage.tmem_base;
+    int ticket_base = 0;
+    bool first_span = true;
+    while (storage.page_count > 0) {
       int const batch_idx = storage.batch_idx;
-      int const work_tile_idx = storage.work_tile_idx;
+      int const page_begin = storage.page_begin;
       int const kv_length = __ldg(params.kv_lengths_ptr + batch_idx);
-      int const page_count =
-          kv_length > 0 ? (kv_length + Traits::kPageTokens - 1) / Traits::kPageTokens : 0;
-      int const scored_page_count = max(page_count - 1, 0);
-      int const page_begin = work_tile_idx * Traits::kPagesPerWorkTile;
-      int const page_end = min(page_begin + Traits::kPagesPerWorkTile, params.max_pages);
-      int const local_pages = max(min(page_end, scored_page_count) - page_begin, 0);
-      int32_t const *page_table =
-          params.page_table_ptr + static_cast<size_t>(batch_idx) * params.max_pages;
-
-      if (local_pages > 0 && thread_idx < (Traits::kQueryLength * Traits::kHeadDim) / 16) {
-        size_t const query_offset =
-            static_cast<size_t>(batch_idx) * Traits::kQueryLength * Traits::kHeadDim;
-        reinterpret_cast<uint4 *>(storage.q_tile)[thread_idx] =
-            reinterpret_cast<uint4 const *>(params.q_ptr + query_offset)[thread_idx];
+      int const page_count = storage.page_count;
+      int32_t const *table = params.page_table_ptr + size_t(batch_idx) * params.max_pages;
+      for (int vector = thread_idx; vector < Traits::kQueryColumns * Traits::kHeadDim / 16;
+           vector += Traits::kThreads) {
+        int const row = vector / 8;
+        int const column = (vector % 8) * 16;
+        size_t const base =
+            size_t(batch_idx) * params.query_length * Traits::kNumIndexHeads * Traits::kHeadDim;
+        *reinterpret_cast<uint4 *>(storage.q_tile + fp8_offset(row, column)) =
+            row < params.query_length * Traits::kNumIndexHeads
+                ? reinterpret_cast<uint4 const *>(params.q_ptr + base)[vector]
+                : uint4{0, 0, 0, 0};
       }
-
-      int const initial_pages = min(local_pages, Traits::kMaxPagesPerCta);
-      if (thread_idx < initial_pages) {
-        int const page_ticket = page_ticket_base + thread_idx;
-        int const slot = page_ticket & (Traits::kMaxPagesPerCta - 1);
-        if (page_ticket >= Traits::kMaxPagesPerCta) {
-          wait(storage.page_consumed_barriers + slot,
-               static_cast<uint32_t>((page_ticket / Traits::kMaxPagesPerCta - 1) & 1));
+      cutlass::arch::fence_view_async_shared();
+      // Start page transport independently of the query loads on the first warps.
+      if (!first_span && warp_idx == kTransportWarp &&
+          lane_idx < min(page_count, Traits::kMaxPagesPerCta)) {
+        int const ticket = ticket_base + lane_idx;
+        int const slot = ticket % Traits::kMaxPagesPerCta;
+        if (ticket >= Traits::kMaxPagesPerCta) {
+          Base::wait(storage.page_consumed_barriers + slot,
+                     ((ticket / Traits::kMaxPagesPerCta) - 1) & 1);
         }
-        int const physical_page = __ldg(page_table + page_begin + thread_idx);
-        issue_page_load(params, storage, slot, physical_page);
+        Base::issue_page_load(params, storage, slot, __ldg(table + page_begin + lane_idx));
       }
       __syncthreads();
-
-      if (warp_idx == Traits::kScoreWarps) {
-        for (int local_page = Traits::kMaxPagesPerCta; local_page < local_pages; ++local_page) {
-          int const page_ticket = page_ticket_base + local_page;
-          int const slot = page_ticket & (Traits::kMaxPagesPerCta - 1);
-          wait(storage.page_consumed_barriers + slot,
-               static_cast<uint32_t>((page_ticket / Traits::kMaxPagesPerCta - 1) & 1));
+      if (warp_idx == kTransportWarp) {
+        for (int page = Traits::kMaxPagesPerCta; page < page_count; ++page) {
+          int const ticket = ticket_base + page;
+          int const slot = ticket % Traits::kMaxPagesPerCta;
+          Base::wait(storage.page_consumed_barriers + slot,
+                     ((ticket / Traits::kMaxPagesPerCta) - 1) & 1);
           if (cute::elect_one_sync()) {
-            int const physical_page = __ldg(page_table + page_begin + local_page);
-            issue_page_load(params, storage, slot, physical_page);
+            Base::issue_page_load(params, storage, slot, __ldg(table + page_begin + page));
           }
         }
         if (cute::elect_one_sync()) {
-          claim_work(params, storage);
+          Base::next_work(params, storage);
         }
-      } else if (local_pages > 0) {
-        int const query_column = lane_idx >> 2;
-        int const thread_group = lane_idx & 3;
-        int const token_begin = warp_idx * 16;
-        int const matrix_offset_a =
-            swizzled_page_offset(token_begin + (lane_idx & 7), lane_idx >> 3);
-        int const matrix_offset_b =
-            swizzled_page_offset(token_begin + 8 + (lane_idx & 7), lane_idx >> 3);
-        int const scale_offset_a =
-            Traits::kPackedKBytes + (token_begin + (lane_idx >> 2)) * Traits::kScaleGroups;
-        int const scale_offset_b = scale_offset_a + 8 * Traits::kScaleGroups;
-#if Q8KV4_INDEXER_HAS_QMUL4
-        uint2 query_fragments_low[4];
-        uint2 query_fragments_high[4];
-        CUTLASS_PRAGMA_UNROLL
-        for (int k_chunk = 0; k_chunk < 4; ++k_chunk) {
-          int const query_offset =
-              query_column * Traits::kHeadDim + 32 * k_chunk + 8 * thread_group;
-          uint2 const query_fragment =
-              *reinterpret_cast<uint2 const *>(storage.q_tile + query_offset);
-          convert_e4m3x4_to_f16x2(query_fragment.x, query_fragments_low[k_chunk].x,
-                                  query_fragments_high[k_chunk].x);
-          convert_e4m3x4_to_f16x2(query_fragment.y, query_fragments_low[k_chunk].y,
-                                  query_fragments_high[k_chunk].y);
+      } else if (warp_idx < kDequantGroups * kDequantWarps) {
+        int const dequant_group = warp_idx / kDequantWarps;
+        int const dequant_thread = thread_idx % (kDequantWarps * cutlass::NumThreadsPerWarp);
+        int const first_page =
+            (dequant_group + kDequantGroups - ticket_base % kDequantGroups) % kDequantGroups;
+        for (int page = first_page; page < page_count; page += kDequantGroups) {
+          int const ticket = ticket_base + page;
+          int const slot = ticket % Traits::kMaxPagesPerCta;
+          int const dequant_slot = ticket % kDequantStages;
+          Base::wait(storage.page_barriers + slot, (ticket / Traits::kMaxPagesPerCta) & 1);
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          dequantize_page(storage, slot, dequant_slot, dequant_thread, tmem_base);
+          cutlass::arch::fence_view_async_tmem_store();
+          asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+          __syncwarp();
+          if (cute::elect_one_sync()) {
+            Base::arrive(storage.dequantized_ready + dequant_slot);
+          }
+          // This worker finishes both roles before reusing its operand/accumulator slot.
+          int const accumulator_slot = ticket % kAccumulatorStages;
+          Base::wait(storage.mma_done + accumulator_slot, (ticket / kAccumulatorStages) & 1);
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          reduce_page(params, storage, batch_idx, page_begin + page, kv_length,
+                      warp_idx % kConsumerWarps, lane_idx, accumulator_slot, dequant_group,
+                      tmem_base);
         }
-#else
-        if (warp_idx == 0) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int k_chunk = 0; k_chunk < 4; ++k_chunk) {
-            int const query_offset =
-                query_column * Traits::kHeadDim + 32 * k_chunk + 8 * thread_group;
-            uint2 const query_fragment =
-                *reinterpret_cast<uint2 const *>(storage.q_tile + query_offset);
-            uint4 transformed;
-            convert_e4m3x4_to_f16x2(query_fragment.x, transformed.x, transformed.z);
-            convert_e4m3x4_to_f16x2(query_fragment.y, transformed.y, transformed.w);
-            storage.query_fragments[k_chunk][lane_idx] = transformed;
-          }
-        }
-        score_barrier();
-#endif
-
-        auto load_page = [&](int local_page, PageFragments &fragments) {
-          int const page_ticket = page_ticket_base + local_page;
-          int const slot = page_ticket & (Traits::kMaxPagesPerCta - 1);
-          uint32_t const phase = static_cast<uint32_t>(page_ticket / Traits::kMaxPagesPerCta) & 1u;
-          wait(storage.page_barriers + slot, phase);
-          uint8_t const *packed = storage.pages[slot];
-          load_matrix_x4(fragments.matrix_a, smem_address(packed + matrix_offset_a));
-          load_matrix_x4(fragments.matrix_b, smem_address(packed + matrix_offset_b));
-          fragments.scale_a = *reinterpret_cast<uint2 const *>(packed + scale_offset_a);
-          fragments.scale_b = *reinterpret_cast<uint2 const *>(packed + scale_offset_b);
-        };
-
-        auto compute_page = [&](int local_page, PageFragments const &fragments) {
-          float accumulator[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-          CUTLASS_PRAGMA_UNROLL
-          for (int k_chunk = 0; k_chunk < 4; ++k_chunk) {
-            uint32_t const scale_a =
-                broadcast_scale_byte(fragments.scale_a, 2 * k_chunk + (thread_group >> 1));
-            uint32_t const scale_b =
-                broadcast_scale_byte(fragments.scale_b, 2 * k_chunk + (thread_group >> 1));
-            uint32_t matrix_low[4];
-            uint32_t matrix_high[4];
-#if Q8KV4_INDEXER_HAS_QMUL4
-            uint32_t matrix[4];
-            matrix[0] = qmul4(static_cast<uint16_t>(fragments.matrix_a[k_chunk]), scale_a);
-            matrix[2] = qmul4(static_cast<uint16_t>(fragments.matrix_a[k_chunk] >> 16), scale_a);
-            matrix[1] = qmul4(static_cast<uint16_t>(fragments.matrix_b[k_chunk]), scale_b);
-            matrix[3] = qmul4(static_cast<uint16_t>(fragments.matrix_b[k_chunk] >> 16), scale_b);
-            CUTLASS_PRAGMA_UNROLL
-            for (int matrix_idx = 0; matrix_idx < 4; ++matrix_idx) {
-              convert_e4m3x4_to_f16x2(matrix[matrix_idx], matrix_low[matrix_idx],
-                                      matrix_high[matrix_idx]);
-            }
-#else
-            dequantize_fp4x8(matrix_low[0], matrix_high[0], matrix_low[2], matrix_high[2],
-                             fragments.matrix_a[k_chunk], scale_a);
-            dequantize_fp4x8(matrix_low[1], matrix_high[1], matrix_low[3], matrix_high[3],
-                             fragments.matrix_b[k_chunk], scale_b);
-#endif
-#if Q8KV4_INDEXER_HAS_QMUL4
-            hmma_f16(accumulator, matrix_low, query_fragments_low[k_chunk]);
-            hmma_f16(accumulator, matrix_high, query_fragments_high[k_chunk]);
-#else
-            uint4 const query_fragment = storage.query_fragments[k_chunk][lane_idx];
-            uint2 const query_low{query_fragment.x, query_fragment.y};
-            uint2 const query_high{query_fragment.z, query_fragment.w};
-            hmma_f16(accumulator, matrix_low, query_low);
-            hmma_f16(accumulator, matrix_high, query_high);
-#endif
-          }
-
-          float maximum0 = fmaxf(accumulator[0], accumulator[2]);
-          float maximum1 = fmaxf(accumulator[1], accumulator[3]);
-          CUTLASS_PRAGMA_UNROLL
-          for (int offset = 4; offset <= 16; offset <<= 1) {
-            maximum0 = fmaxf(maximum0, __shfl_xor_sync(0xffffffffu, maximum0, offset));
-            maximum1 = fmaxf(maximum1, __shfl_xor_sync(0xffffffffu, maximum1, offset));
-          }
-          if (lane_idx < 4) {
-            storage.page_partials[local_page][2 * thread_group][warp_idx] = maximum0;
-            storage.page_partials[local_page][2 * thread_group + 1][warp_idx] = maximum1;
-          }
-        };
-
-        if constexpr (Traits::kMaxPagesPerCta == 4) {
-          PageFragments fragments;
-          for (int local_page = 0; local_page < local_pages; ++local_page) {
-            load_page(local_page, fragments);
-            compute_page(local_page, fragments);
-            if (cute::elect_one_sync()) {
-              int const page_ticket = page_ticket_base + local_page;
-              arrive(storage.page_consumed_barriers +
-                     (page_ticket & (Traits::kMaxPagesPerCta - 1)));
-            }
-          }
-        } else {
-          PageFragments fragments_a;
-          PageFragments fragments_b;
-          int local_page = 0;
-          for (; local_page + 1 < local_pages; local_page += 2) {
-            load_page(local_page, fragments_a);
-            load_page(local_page + 1, fragments_b);
-            compute_page(local_page, fragments_a);
-            compute_page(local_page + 1, fragments_b);
-            if (cute::elect_one_sync()) {
-              int const page_ticket_a = page_ticket_base + local_page;
-              int const page_ticket_b = page_ticket_a + 1;
-              arrive(storage.page_consumed_barriers +
-                     (page_ticket_a & (Traits::kMaxPagesPerCta - 1)));
-              arrive(storage.page_consumed_barriers +
-                     (page_ticket_b & (Traits::kMaxPagesPerCta - 1)));
-            }
-          }
-          if (local_page < local_pages) {
-            load_page(local_page, fragments_a);
-            compute_page(local_page, fragments_a);
-            if (cute::elect_one_sync()) {
-              int const page_ticket = page_ticket_base + local_page;
-              arrive(storage.page_consumed_barriers +
-                     (page_ticket & (Traits::kMaxPagesPerCta - 1)));
-            }
-          }
-        }
-
-        score_barrier();
-        int const row = warp_idx;
-        int const query_position = max(kv_length - Traits::kQueryLength + row, 0);
-        int const query_local_page = query_position / Traits::kPageTokens;
-        for (int tile_page = lane_idx; tile_page < local_pages;
-             tile_page += cutlass::NumThreadsPerWarp) {
-          int const logical_page = page_begin + tile_page;
-          if (logical_page < query_local_page) {
-            float const score = fold_page_score(storage, tile_page, row);
-            size_t const output_offset =
-                (static_cast<size_t>(batch_idx) * Traits::kQueryLength + row) * params.max_pages +
-                logical_page;
-            params.output_ptr[output_offset] = score;
-          }
+      } else if (warp_idx == kMmaWarp) {
+        for (int page = 0; page < page_count; ++page) {
+          int const ticket = ticket_base + page;
+          int const accumulator_slot = ticket % kAccumulatorStages;
+          int const slot = ticket % kDequantStages;
+          Base::wait(storage.dequantized_ready + slot, (ticket / kDequantStages) & 1);
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          issue_mma(storage, slot, accumulator_slot, tmem_base);
+          // Publish only after every accumulator column is ready.
+          cutlass::arch::umma_arrive(storage.mma_done + accumulator_slot);
         }
       }
-
-      page_ticket_base += local_pages;
+      ticket_base += page_count;
+      first_span = false;
       __syncthreads();
+    }
+    __syncthreads();
+    if (warp_idx == 0) {
+      cute::TMEM::Allocator1Sm allocator;
+      allocator.free(tmem_base, kTmemColumns);
     }
   }
 };

@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 // SPDX-License-Identifier: MIT
 
-// Q8KV4 paged decode indexer proxy scores over the vLLM packed NVFP4 page.
+// Q8KV4 paged decode indexer proxy scores over the vLLM packed NVFP4 page for one, two or
+// four index heads, on the SM100 TMEM-source FP8 MMA. The work schedule comes from the shared
+// decode plan (cute/src/sm100/decode_indexer_plan.py).
 
-#include <cub/device/device_scan.cuh>
-
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -15,42 +14,14 @@
 
 namespace q8kv4_indexer {
 
-cudaError_t get_indexer_gemm_scheduler_temp_storage_bytes(int batch, size_t &temp_storage_bytes) {
-  temp_storage_bytes = 0;
-  if (batch <= IndexerGemmTraits::kPrepareThreads) {
-    return cudaSuccess;
-  }
-  return cub::DeviceScan::InclusiveSum(nullptr, temp_storage_bytes, static_cast<int32_t *>(nullptr),
-                                       static_cast<int32_t *>(nullptr), batch);
-}
-
-cudaError_t run_indexer_gemm_scheduler_scan(int32_t *prefix, int batch, void *temp_storage,
-                                            size_t temp_storage_bytes, cudaStream_t stream) {
-  return cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes, prefix, prefix, batch,
-                                       stream);
-}
-
-cudaError_t prepare_indexer_gemm(IndexerGemmArguments const &arguments, cudaStream_t stream) {
-  using Runner = IndexerGemmRunner<IndexerGemmTraits>;
-  if (!Runner::can_plan(arguments)) {
-    return cudaErrorNotSupported;
-  }
-  IndexerGemmParams params{};
-  cudaError_t status = Runner::to_plan_params(arguments, params);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  return Runner::plan(params, arguments.scheduler_temp_storage_ptr,
-                      arguments.scheduler_temp_storage_bytes, stream);
-}
-
+template <typename Traits>
 cudaError_t launch_indexer_gemm(IndexerGemmArguments const &arguments, cudaStream_t stream) {
-  using Runner = IndexerGemmRunner<IndexerGemmTraits>;
+  using Runner = IndexerGemmRunner<Traits>;
   if (!Runner::can_run(arguments)) {
     return cudaErrorNotSupported;
   }
   IndexerGemmParams params{};
-  cudaError_t status = Runner::to_underlying_arguments(arguments, params);
+  cudaError_t const status = Runner::to_underlying_arguments(arguments, params);
   if (status != cudaSuccess) {
     return status;
   }
@@ -62,16 +33,9 @@ cudaError_t launch_indexer_gemm(IndexerGemmArguments const &arguments, cudaStrea
 namespace {
 
 using q8kv4_indexer::IndexerGemmArguments;
-using q8kv4_indexer::IndexerGemmTraits;
-
-constexpr size_t kWorkspaceAlignment = 256;
-
-struct WorkspaceLayout {
-  size_t scheduler_bytes = 0;
-  size_t temp_storage_offset = 0;
-  size_t temp_storage_bytes = 0;
-  size_t total_bytes = 0;
-};
+using q8kv4_indexer::IndexerGemmTraitsForHeads;
+// Head-independent limits shared by every specialization.
+using IndexerGemmTraits = IndexerGemmTraitsForHeads<1, 16>;
 
 template <typename T> T *tensor_data(TensorView tensor) {
   return reinterpret_cast<T *>(static_cast<char *>(tensor.data_ptr()) + tensor.byte_offset());
@@ -83,32 +47,8 @@ int checked_batch(int64_t batch_size) {
   return static_cast<int>(batch_size);
 }
 
-size_t scheduler_workspace_bytes(int batch) {
-  int64_t const element_count =
-      std::max<int64_t>(static_cast<int64_t>(batch) + 2,
-                        static_cast<int64_t>(IndexerGemmTraits::kPrepareThreads) + 2);
-  return static_cast<size_t>(element_count) * sizeof(int32_t);
-}
-
-WorkspaceLayout get_workspace_layout(int batch) {
-  WorkspaceLayout layout{};
-  layout.scheduler_bytes = scheduler_workspace_bytes(batch);
-  cudaError_t const status = q8kv4_indexer::get_indexer_gemm_scheduler_temp_storage_bytes(
-      batch, layout.temp_storage_bytes);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "Q8KV4 indexer scheduler workspace query failed: " << cudaGetErrorString(status);
-  if (layout.temp_storage_bytes == 0) {
-    layout.temp_storage_offset = layout.scheduler_bytes;
-    layout.total_bytes = layout.scheduler_bytes;
-    return layout;
-  }
-  layout.temp_storage_offset =
-      (layout.scheduler_bytes + kWorkspaceAlignment - 1) & ~(kWorkspaceAlignment - 1);
-  TVM_FFI_ICHECK(layout.temp_storage_bytes <=
-                 std::numeric_limits<size_t>::max() - layout.temp_storage_offset)
-      << "workspace size overflow";
-  layout.total_bytes = layout.temp_storage_offset + layout.temp_storage_bytes;
-  return layout;
+int64_t scheduler_words(int batch, int64_t workers) {
+  return static_cast<int64_t>(batch) + (1 + q8kv4_indexer::kWorkerStartFields) * workers + 2;
 }
 
 void check_metadata(TensorView page_table, TensorView seq_lens) {
@@ -124,71 +64,35 @@ void check_metadata(TensorView page_table, TensorView seq_lens) {
   TVM_FFI_ICHECK(seq_lens.size(0) == page_table.size(0)) << "seq_lens must have shape [batch]";
 }
 
-void check_workspace(TensorView reference, TensorView workspace, size_t required_bytes) {
-  CHECK_INPUT_AND_TYPE(workspace, dl_uint8);
-  CHECK_DIM(1, workspace);
-  CHECK_DEVICE(workspace, reference);
-  TVM_FFI_ICHECK(static_cast<uint64_t>(workspace.size(0)) >= required_bytes)
-      << "workspace is too small: need " << required_bytes << " bytes, got " << workspace.size(0);
-  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor_data<uint8_t>(workspace)) % alignof(int32_t) ==
-                 0)
-      << "workspace address must be aligned to int32";
-}
-
-} // namespace
-
-int64_t q8kv4_indexer_workspace_size(int64_t batch_size) {
-  WorkspaceLayout const layout = get_workspace_layout(checked_batch(batch_size));
-  TVM_FFI_ICHECK(layout.total_bytes <= static_cast<size_t>(std::numeric_limits<int64_t>::max()))
-      << "workspace size does not fit in int64";
-  return static_cast<int64_t>(layout.total_bytes);
-}
-
-void q8kv4_indexer_plan(TensorView page_table, TensorView seq_lens, TensorView workspace,
-                        int64_t stream_ptr) {
-  check_metadata(page_table, seq_lens);
-  int const batch = checked_batch(page_table.size(0));
-  WorkspaceLayout const layout = get_workspace_layout(batch);
-  check_workspace(page_table, workspace, layout.total_bytes);
-
-  ffi::CUDADeviceGuard device_guard(page_table.device().device_id);
-  cudaStream_t const stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-  uint8_t *workspace_ptr = tensor_data<uint8_t>(workspace);
-  IndexerGemmArguments arguments{};
-  arguments.page_table_ptr = tensor_data<int32_t const>(page_table);
-  arguments.kv_lengths_ptr = tensor_data<int32_t const>(seq_lens);
-  arguments.scheduler_workspace_ptr = reinterpret_cast<int32_t *>(workspace_ptr);
-  arguments.scheduler_temp_storage_ptr =
-      layout.temp_storage_bytes > 0 ? workspace_ptr + layout.temp_storage_offset : nullptr;
-  arguments.scheduler_temp_storage_bytes = layout.temp_storage_bytes;
-  arguments.batch = batch;
-  arguments.max_pages = static_cast<int>(page_table.size(1));
-
-  cudaError_t const status = q8kv4_indexer::prepare_indexer_gemm(arguments, stream);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "Q8KV4 indexer plan failed: " << cudaGetErrorString(status);
-}
-
-void q8kv4_indexer_run(TensorView q, TensorView k_cache, TensorView page_table, TensorView seq_lens,
-                       TensorView workspace, int64_t sm_count, TensorView output,
-                       int64_t stream_ptr) {
-  using Traits = IndexerGemmTraits;
+template <typename Traits>
+void run_indexer(TensorView q, TensorView k_cache, TensorView page_table, TensorView seq_lens,
+                 TensorView scheduler, int64_t sm_count, TensorView output, int64_t stream_ptr) {
   check_metadata(page_table, seq_lens);
   CHECK_INPUT_AND_TYPE(q, dl_float8_e4m3fn);
   CHECK_CUDA(k_cache);
   CHECK_INPUT_TYPE(k_cache, dl_uint8);
+  CHECK_INPUT_AND_TYPE(scheduler, dl_int32);
   CHECK_INPUT_AND_TYPE(output, dl_float32);
   CHECK_DEVICE(q, page_table);
   CHECK_DEVICE(k_cache, page_table);
+  CHECK_DEVICE(scheduler, page_table);
   CHECK_DEVICE(output, page_table);
+  CHECK_DIM(1, scheduler);
 
   int const batch = checked_batch(page_table.size(0));
   int const max_pages = static_cast<int>(page_table.size(1));
   TVM_FFI_ICHECK(sm_count > 0 && sm_count <= std::numeric_limits<int>::max())
       << "sm_count must be positive and fit in int32";
-  TVM_FFI_ICHECK(q.ndim() == 3 && q.size(0) == static_cast<int64_t>(batch) * Traits::kQueryLength &&
-                 q.size(1) == 1 && q.size(2) == Traits::kHeadDim)
-      << "q must have shape [batch * 8, 1, 128]";
+  TVM_FFI_ICHECK(q.ndim() == 3 && q.size(0) > 0 && q.size(0) % batch == 0 &&
+                 q.size(1) == Traits::kNumIndexHeads && q.size(2) == Traits::kHeadDim)
+      << "q must have shape [batch * Q, heads, 128]";
+  int64_t const query_length = q.size(0) / batch;
+  TVM_FFI_ICHECK(query_length >= 1 && query_length <= Traits::kMaxQueryLength &&
+                 query_length * Traits::kNumIndexHeads <= Traits::kQueryColumns)
+      << "query tokens per request must be in [1, "
+      << Traits::kQueryColumns / Traits::kNumIndexHeads << "]";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor_data<uint8_t>(q)) % 16 == 0)
+      << "q data pointer must be 16-byte aligned";
   TVM_FFI_ICHECK(k_cache.ndim() == 3 && k_cache.size(0) > 0 &&
                  k_cache.size(0) <= std::numeric_limits<int>::max() &&
                  k_cache.size(1) == Traits::kPageTokens &&
@@ -201,9 +105,12 @@ void q8kv4_indexer_run(TensorView q, TensorView k_cache, TensorView page_table, 
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor_data<uint8_t>(k_cache)) % 16 == 0)
       << "k_cache data pointer must be 16-byte aligned";
   TVM_FFI_ICHECK(output.ndim() == 3 && output.size(0) == batch &&
-                 output.size(1) == Traits::kQueryLength && output.size(2) == max_pages)
-      << "scores must have shape [batch, 8, max_pages]";
-  check_workspace(page_table, workspace, scheduler_workspace_bytes(batch));
+                 output.size(1) == query_length * Traits::kNumIndexHeads &&
+                 output.size(2) == max_pages)
+      << "scores must have shape [batch, Q * heads, max_pages]";
+  TVM_FFI_ICHECK(scheduler.size(0) >= scheduler_words(batch, sm_count))
+      << "scheduler is too small: need " << scheduler_words(batch, sm_count)
+      << " int32 words for this batch and worker count";
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   IndexerGemmArguments arguments{};
@@ -211,20 +118,70 @@ void q8kv4_indexer_run(TensorView q, TensorView k_cache, TensorView page_table, 
   arguments.k_cache_ptr = tensor_data<void const>(k_cache);
   arguments.page_table_ptr = tensor_data<int32_t const>(page_table);
   arguments.kv_lengths_ptr = tensor_data<int32_t const>(seq_lens);
-  arguments.scheduler_workspace_ptr = reinterpret_cast<int32_t *>(tensor_data<uint8_t>(workspace));
+  arguments.scheduler_workspace_ptr = tensor_data<int32_t const>(scheduler);
   arguments.output_ptr = tensor_data<float>(output);
   arguments.batch = batch;
+  arguments.query_length = static_cast<int>(query_length);
   arguments.max_pages = max_pages;
   arguments.physical_pages = static_cast<int>(k_cache.size(0));
   arguments.page_stride_bytes = k_cache.stride(0);
   arguments.sm_count = static_cast<int>(sm_count);
 
   cudaError_t const status =
-      q8kv4_indexer::launch_indexer_gemm(arguments, reinterpret_cast<cudaStream_t>(stream_ptr));
+      q8kv4_indexer::launch_indexer_gemm<Traits>(arguments,
+                                                 reinterpret_cast<cudaStream_t>(stream_ptr));
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Q8KV4 indexer run failed: " << cudaGetErrorString(status);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(q8kv4_indexer_workspace_size, q8kv4_indexer_workspace_size);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(q8kv4_indexer_plan, q8kv4_indexer_plan);
+template <int NumIndexHeads>
+void run_for_heads(int64_t query_columns, TensorView q, TensorView k_cache, TensorView page_table,
+                   TensorView seq_lens, TensorView scheduler, int64_t sm_count, TensorView output,
+                   int64_t stream_ptr) {
+#define Q8KV4_RUN(COLUMNS)                                                                         \
+  if (query_columns == COLUMNS) {                                                                  \
+    if constexpr (COLUMNS <= 16 * NumIndexHeads) {                                                 \
+      return run_indexer<IndexerGemmTraitsForHeads<NumIndexHeads, COLUMNS>>(                       \
+          q, k_cache, page_table, seq_lens, scheduler, sm_count, output, stream_ptr);              \
+    }                                                                                              \
+  }
+  Q8KV4_RUN(16)
+  Q8KV4_RUN(32)
+  Q8KV4_RUN(48)
+  Q8KV4_RUN(64)
+#undef Q8KV4_RUN
+  TVM_FFI_THROW(ValueError) << "query tokens per request must be in [1, "
+                            << IndexerGemmTraits::kMaxQueryLength << "]";
+}
+
+} // namespace
+
+// ``q`` is [batch * Q, heads, 128] with heads 1, 2 or 4. ``seq_lens`` and ``scheduler`` are the
+// shared plan's length snapshot and int32 schedule; ``sm_count`` must be the plan's worker count.
+// Scores are written for the historical pages before each query's local page; the local page and
+// later columns stay untouched.
+void q8kv4_indexer_run(TensorView q, TensorView k_cache, TensorView page_table, TensorView seq_lens,
+                       TensorView scheduler, int64_t sm_count, TensorView output,
+                       int64_t stream_ptr) {
+  CHECK_DIM(2, page_table);
+  TVM_FFI_ICHECK(q.ndim() == 3 && page_table.size(0) > 0 && q.size(0) % page_table.size(0) == 0)
+      << "q must have shape [batch * Q, heads, 128]";
+  int64_t const heads = q.size(1);
+  int64_t const query_length = q.size(0) / page_table.size(0);
+  int64_t const query_columns = (query_length * heads + 15) / 16 * 16;
+  switch (heads) {
+  case 1:
+    return run_for_heads<1>(query_columns, q, k_cache, page_table, seq_lens, scheduler, sm_count,
+                            output, stream_ptr);
+  case 2:
+    return run_for_heads<2>(query_columns, q, k_cache, page_table, seq_lens, scheduler, sm_count,
+                            output, stream_ptr);
+  case 4:
+    return run_for_heads<4>(query_columns, q, k_cache, page_table, seq_lens, scheduler, sm_count,
+                            output, stream_ptr);
+  default:
+    TVM_FFI_THROW(ValueError) << "q8kv4_indexer_run supports 1, 2 or 4 index heads, got " << heads;
+  }
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(q8kv4_indexer_run, q8kv4_indexer_run);

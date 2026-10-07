@@ -1,0 +1,76 @@
+{
+  "repository": "MiniMax-AI/MSA",
+  "branch": "nv_dev",
+  "commit": "9ae7751cf6b28f1c551a284de90dddf9971d621e",
+  "scope": "Blackwell (SM100/SM103) decode indexer optimizations",
+  "note": "sha256 values hash the original donor files, not the adapted destinations.",
+  "files": [
+    {
+      "source": "inference/msa_v1/indexer/decode/q8kv4/csrc/include/sm100/collective/sm100_indexer_gemm_umma.hpp",
+      "destination": "python/fmha_sm100/csrc/include/q8kv4_indexer/collective.hpp",
+      "sha256": "4675f9d279303fd20de7151d86b4e95c4f1b71b9067c6b02dc272d0a8488c9a0"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/q8kv4/csrc/include/sm100/collective/sm100_indexer_gemm_config.hpp",
+      "destination": "python/fmha_sm100/csrc/include/q8kv4_indexer/config.hpp",
+      "sha256": "f592824bf9a48de54a0a6281c4e34c8cac7e190e7c616998b9f486895956d1bf"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/q8kv4/csrc/include/sm100/common/indexer_gemm_traits.hpp",
+      "destination": "python/fmha_sm100/csrc/include/q8kv4_indexer/traits.hpp",
+      "sha256": "321100c83a03b140c1ba836aeb50725bd5f4833476b9ce6a860bb5b212c72c13"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/q8kv4/csrc/include/sm100/common/indexer_gemm_params.hpp",
+      "destination": "python/fmha_sm100/csrc/include/q8kv4_indexer/params.hpp",
+      "sha256": "f0b8ebd471c35893c3c29cae96883bd86c4e31ede9a6bfbeb70637625c4069ca"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/q8kv4/csrc/include/sm100/common/indexer_gemm_arguments.hpp",
+      "destination": "python/fmha_sm100/csrc/include/q8kv4_indexer/arguments.hpp",
+      "sha256": "e036a1b01b96fb9541dd54f7badf927833e57d516f4c9c8af8e4179bd38aeece"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/q8kv4/csrc/include/sm100/device/indexer_gemm.hpp",
+      "destination": "python/fmha_sm100/csrc/include/q8kv4_indexer/runner.hpp",
+      "sha256": "4142028e009f74d109357192383b1691c7ac0725ce6a8a2c7b64fe5cf2e5268a"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/q8kv4/csrc/include/sm100/kernel/sm100_indexer_gemm_kernel.hpp",
+      "destination": "python/fmha_sm100/csrc/include/q8kv4_indexer/kernel.hpp",
+      "sha256": "a549a47cdd6197c8c28cb411ce2f4219c1273c6f33e98c7425791d4fd57ef472"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/plan_kernel.py",
+      "destination": "python/fmha_sm100/cute/src/sm100/decode_indexer_plan.py",
+      "sha256": "395be849f689cd6aad90f3c15e861d4ce366da351209b89becacd4c9c1642c70"
+    },
+    {
+      "source": "inference/msa_v1/indexer/decode/plan.py",
+      "destination": "python/fmha_sm100/cute/q8_indexer_interface.py (BatchDecodeIndexerPlan)",
+      "sha256": "fe0f4c1dba4c9c339319492636779125c6737ddfb00bc7480bcc15f22b169a97"
+    },
+    {
+      "source": "inference/msa_v1/indexer/_common/topk_select/csrc/kernel/indexer_topk.cu",
+      "destination": "python/fmha_sm100/csrc/indexer_topk_select.cu (compact_grid)",
+      "sha256": "96aa008779a723078b9a522dba89bd9576e12e92b8d2faf9cb0dcf9aa0e2c51d"
+    }
+  ],
+  "adaptations": [
+    "namespace q8kv4_indexer and dev's TVM-FFI binding (q8kv4_indexer_decode.cu) instead of the donor torch extension",
+    "one, two and four heads dispatched at run time over IndexerGemmTraitsForHeads<heads, 16..64>, replacing dev's CuTe DSL kernel for two and four heads",
+    "TMA descriptors read vLLM's fused NVFP4 page (packed values then scales, shared page stride) instead of separate data and scale tensors",
+    "scores stored token-major, [batch, Q * H, max_pages], instead of head-major",
+    "dev's compile-time QMUL4 detection (nvfp4_to_e4m3.cuh) instead of the donor's toolchain probe",
+    "plan kernel writes valid-page counts token-major (row * heads + head) to match dev's TopK rows",
+    "BatchDecodeIndexerPlan keeps dev's eight-token MTP query length, dev's AOT cache and int32 workspace alignment; owned plans rebind to new seq_lens instead of reallocating",
+    "dev's CuTe DSL decode indexers read the plan's page prefix and length snapshot",
+    "compact TopK grid enabled for Q8KV4 decode wrappers only, as in the donor"
+  ],
+  "not_ported": [
+    "query lengths other than eight (donor supports 1 to 16)",
+    "BF16 decode indexer",
+    "donor Q8KV8 / BF16 CuTe decode indexer GEMM (dev keeps its own)",
+    "donor head-major output layout and separate-scale cache API"
+  ]
+}

@@ -20,8 +20,13 @@ template <typename T> T *tensor_data(TensorView tensor) {
 
 // ``lengths[row]`` counts the row's candidate pages including the forced local
 // page, which is written to the final slot without being ranked.
+//
+// ``compact_grid`` launches ceil(rows / rows_per_block) CTAs instead of one CTA per row.
+// The row mapping is the kernel's own, so the output is bit-identical; only the surplus
+// warp-family CTAs, which retire without work, are removed (ported from MiniMax-AI/MSA
+// nv_dev indexer/_common/topk_select).
 void indexer_topk_select(TensorView scores, TensorView lengths, TensorView output,
-                         int64_t stream_ptr) {
+                         bool compact_grid, int64_t stream_ptr) {
   CHECK_CUDA(scores);
   CHECK_DIM(2, scores);
   TVM_FFI_ICHECK(encode_dlpack_dtype(scores.dtype()) == float32_code) << "scores must be float32";
@@ -46,10 +51,23 @@ void indexer_topk_select(TensorView scores, TensorView lengths, TensorView outpu
   CHECK_DEVICE(output, scores);
 
   ffi::CUDADeviceGuard device_guard(scores.device().device_id);
-  m3::m3_launch(tensor_data<float const>(scores), tensor_data<int const>(lengths),
-                tensor_data<int>(output), static_cast<int>(scores.size(1)),
-                static_cast<int>(scores.stride(0)), static_cast<int>(scores.size(0)),
-                reinterpret_cast<cudaStream_t>(stream_ptr));
+  float const *score_ptr = tensor_data<float const>(scores);
+  int const *length_ptr = tensor_data<int const>(lengths);
+  int *output_ptr = tensor_data<int>(output);
+  int const max_cols = static_cast<int>(scores.size(1));
+  int const row_stride = static_cast<int>(scores.stride(0));
+  int const rows = static_cast<int>(scores.size(0));
+  cudaStream_t const stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  if (compact_grid) {
+    int const rows_per_block = m3::m3_rows_per_block(max_cols);
+    int const blocks = rows / rows_per_block + (rows % rows_per_block != 0);
+    // The warp family owns one row per warp; the block family uses the full CTA.
+    int const threads = rows_per_block > 1 ? rows_per_block * 32 : m3::kThreads;
+    m3::m3_topk_kernel<<<blocks, threads, 0, stream>>>(score_ptr, length_ptr, output_ptr,
+                                                       max_cols, row_stride, rows);
+  } else {
+    m3::m3_launch(score_ptr, length_ptr, output_ptr, max_cols, row_stride, rows, stream);
+  }
   cudaError_t const status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "indexer_topk_select launch failed: " << cudaGetErrorString(status);

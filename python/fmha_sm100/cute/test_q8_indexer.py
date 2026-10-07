@@ -19,6 +19,7 @@ import torch
 
 import q8_indexer_interface
 from q8_indexer_interface import (
+    BatchDecodeIndexerPlan,
     BatchDecodeIndexerQ8KV4Wrapper,
     BatchDecodeIndexerQ8KV8Wrapper,
     BatchPrefillIndexerQ8KV8Wrapper,
@@ -517,6 +518,83 @@ def test_decode_concurrent_streams_do_not_alias(fmt, num_heads):
         assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("num_heads", (1, 2, 4))
+def test_decode_shared_plan_matches_owned_plans(num_heads):
+    """One plan serves Q8KV8 and Q8KV4 wrappers and matches their own plans bit for bit."""
+
+    batch, max_pages = 77, 9
+    q8, k8, block_table, seq_lens = _make_decode(
+        "q8kv8", batch, max_pages, 51, num_heads=num_heads
+    )
+    q4, k4, _, _ = _make_decode("q8kv4", batch, max_pages, 52, num_heads=num_heads)
+    inputs = {"q8kv8": (q8, k8), "q8kv4": (q4, k4)}
+    expected = {}
+    for fmt, (q, k) in inputs.items():
+        owned = DECODE_WRAPPERS[fmt](num_heads=num_heads)
+        owned.plan(block_table, seq_lens)
+        expected[fmt] = owned.run(q, k.cache).clone()
+
+    plan = BatchDecodeIndexerPlan(seq_lens, max_pages=max_pages, num_heads=num_heads)
+    wrappers = {fmt: DECODE_WRAPPERS[fmt](num_heads=num_heads) for fmt in inputs}
+    for wrapper in wrappers.values():
+        wrapper.plan(block_table, seq_lens, shared_plan=plan)
+    with pytest.raises(RuntimeError, match=r"update\(\) must run"):
+        wrappers["q8kv8"].run(q8, k8.cache)
+    plan.update()
+    lengths = _decode_valid_pages(seq_lens, num_heads)
+    for fmt, (q, k) in inputs.items():
+        assert torch.equal(wrappers[fmt].run(q, k.cache), expected[fmt])
+        torch.testing.assert_close(wrappers[fmt]._num_valid_pages, lengths, atol=0, rtol=0)
+
+    with pytest.raises(ValueError, match="different seq_lens"):
+        wrappers["q8kv8"].plan(block_table, seq_lens.clone(), shared_plan=plan)
+    workspace = torch.empty(
+        BatchDecodeIndexerQ8KV8Wrapper.workspace_size(batch, num_heads=num_heads),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    with pytest.raises(ValueError, match="owns its workspace"):
+        BatchDecodeIndexerQ8KV8Wrapper(workspace, num_heads=num_heads).plan(
+            block_table, seq_lens, shared_plan=plan
+        )
+
+
+@pytest.mark.parametrize("num_heads", (1, 4))
+def test_decode_shared_plan_update_replays_in_cuda_graph(num_heads):
+    """A captured plan.update() picks up block-table and length changes made in place."""
+
+    batch, max_pages = 64, 6
+    q, k, block_table, seq_lens = _make_decode("q8kv4", batch, max_pages, 61, num_heads=num_heads)
+    table_buffer = block_table.clone()
+    lens_buffer = seq_lens.clone()
+    plan = BatchDecodeIndexerPlan(lens_buffer, max_pages=max_pages, num_heads=num_heads)
+    wrapper = BatchDecodeIndexerQ8KV4Wrapper(
+        num_heads=num_heads,
+        use_cuda_graph=True,
+        block_table_buffer=table_buffer,
+        seq_lens_buffer=lens_buffer,
+    )
+    wrapper.plan(table_buffer, lens_buffer, shared_plan=plan)
+    out = torch.empty((batch * MTP, num_heads, TOP_K), dtype=torch.int32, device="cuda")
+    plan.update()
+    wrapper.run(q, k.cache, out=out)  # compile outside capture
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.update()
+        wrapper.run(q, k.cache, out=out)
+    _, _, next_table, next_lens = _make_decode("q8kv4", batch, max_pages, 62)
+    table_buffer.copy_(next_table)
+    lens_buffer.copy_(next_lens)
+    out.fill_(-777)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    reference = BatchDecodeIndexerQ8KV4Wrapper(num_heads=num_heads)
+    reference.plan(next_table, next_lens)
+    assert torch.equal(out, reference.run(q, k.cache))
+
+
 def test_decode_compile_is_shape_independent_and_workspace_is_released():
     """Batch, page-table width, and lengths reuse one compiled kernel per format and heads."""
 
@@ -945,6 +1023,19 @@ def test_topk_select_contract(max_cols):
     baseline = out.clone()
     for _ in range(3):
         assert torch.equal(_topk_select(scores, lengths, out), baseline)
+    assert torch.equal(_topk_select(scores, lengths, out, compact_grid=True), baseline)
+
+
+@pytest.mark.parametrize("max_cols", (17, 257, 258, 4097))
+@pytest.mark.parametrize("num_rows", (1, 3, 4, 5, 4099))
+def test_topk_select_compact_grid_is_bit_identical(max_cols, num_rows):
+    """The packed grid keeps the kernel's row mapping for both families and ragged tails."""
+
+    scores, lengths = _focused_topk_inputs(max_cols, num_rows=num_rows, seed=max_cols + num_rows)
+    out = torch.empty((num_rows, 1, TOP_K), dtype=torch.int32, device="cuda")
+    expected = _topk_select(scores, lengths, out).clone()
+    out.fill_(-777)
+    assert torch.equal(_topk_select(scores, lengths, out, compact_grid=True), expected)
 
 
 def test_topk_select_exact_ties():
