@@ -78,10 +78,13 @@ def _can_run_blackwell_prefill(q, k, v, plan, page_table, *, q_offset_override=N
         return False
     if k.ndim != 4 or k.shape != v.shape or k.shape[-2:] != (128, 128) or k.shape[1] <= 0:
         return False
-    if any(t.dtype != q.dtype or t.device != q.device or t.stride(-1) != 1
-           or t.data_ptr() % 16 for t in (q, k, v)):
+    if k.dtype != v.dtype or not (
+        k.dtype == q.dtype
+        or (q.dtype == torch.bfloat16 and k.dtype == torch.float8_e4m3fn)
+    ):
         return False
-    if q.dtype == torch.float8_e4m3fn and not (k.is_contiguous() and v.is_contiguous()):
+    if any(t.device != q.device or t.stride(-1) != 1
+           or t.data_ptr() % 16 for t in (q, k, v)):
         return False
     ratio, remainder = divmod(q.shape[1], k.shape[1])
     allowed = (8, 16) if q.dtype == torch.bfloat16 else (1, 2, 4, 8, 16)
@@ -110,7 +113,7 @@ def _prepare_blackwell_metadata(
     )
 
 
-def _run_blackwell_prefill(q, k, v, plan, q2k, page_table, *, sm_scale=None, out=None):
+def _run_blackwell_prefill(q, k, v, plan, q2k, page_table, *, sm_scale=None, out=None, output_scale=None):
     from src.blackwell_prefill.atten_fwd_sm100 import run_pagekv
     from src.blackwell_prefill.combine import combine
 
@@ -129,7 +132,8 @@ def _run_blackwell_prefill(q, k, v, plan, q2k, page_table, *, sm_scale=None, out
                softmax_scale=q.shape[-1] ** -0.5 if sm_scale is None else float(sm_scale),
                max_seqlen_q=plan["max_seqlen_q"])
     combine(partial, stats, out, None, cu_seqlens=plan["cu_seqlens_q"],
-            split_counts=schedule.split_counts, use_pdl=True, raw_partial_stats=False)
+            split_counts=schedule.split_counts, use_pdl=True, raw_partial_stats=False,
+            output_scale=output_scale)
     return out
 
 

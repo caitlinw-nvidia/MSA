@@ -3324,8 +3324,11 @@ def _compile_kernel(
     use_fp16_softmax, use_2x_fp8 = _resolve_rubin_options(
         capability, q.dtype, enable_fp16_softmax, enable_2x_fp8
     )
-    if k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
-        raise TypeError("Q, K, and V must use the same storage dtype")
+    if k_cache.dtype != v_cache.dtype or not (
+        k_cache.dtype == q.dtype
+        or (q.dtype == torch.bfloat16 and k_cache.dtype == torch.float8_e4m3fn)
+    ):
+        raise TypeError("unsupported Q/K/V storage dtype combination")
     key = (
         "blackwell_prefill_msa_v1_attention_prefill_atten_fwd_sm100",
         capability,
@@ -3333,6 +3336,8 @@ def _compile_kernel(
         qheadperkv,
         _BLOCK_KV,
         q.dtype,
+        k_cache.dtype,
+        v_cache.dtype,
         torch.bfloat16,
         True,
         use_fp16_softmax,
