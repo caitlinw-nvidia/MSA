@@ -28,7 +28,9 @@ _MM_SPARSE_DIR = os.path.join(
 if os.path.isdir(_MM_SPARSE_DIR) and _MM_SPARSE_DIR not in sys.path:
     sys.path.insert(0, os.path.abspath(_MM_SPARSE_DIR))
 
-from interface import sparse_atten_func, sparse_atten_nvfp4_kv_func
+from interface import (
+    sparse_atten_func, sparse_atten_nvfp4_kv_func, _supports_blackwell_prefill,
+)
 from sparse_index_utils import build_k2q_csr
 from src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL
 from src.common.aot_cache import aot_object_path
@@ -441,9 +443,14 @@ def sparse_fmha(
         seqused_k=seqused_k,
         schedule=schedule,
         usable_SM_count=usable_SM_count,
+        out=out if (
+            out is not None and out.dtype == torch.bfloat16
+            and out.shape == q.shape and out.device == q.device
+            and out.is_contiguous() and out.data_ptr() % 16 == 0
+        ) else None,
     )
 
-    if out is not None:
+    if out is not None and result is not out:
         out.copy_(result)
         return out, None
     return result, None
