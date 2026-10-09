@@ -595,6 +595,7 @@ class _PrefillPlanState:
     plan_error: torch.Tensor
     task_capacity: int
     num_candidate_q_tiles: int
+    max_page_chunk: int
     total_q: int
     num_heads: int
     scores: torch.Tensor
@@ -634,12 +635,19 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
             Int32(state.num_candidate_q_tiles),
             Int32(state.task_capacity),
             Int32(state.num_heads),
+            Int32(state.max_page_chunk),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         ),
     )
     reset_compiled(state.task_counts, state.plan_error)
-    build_compiled(*build_args, state.num_candidate_q_tiles, state.task_capacity, state.num_heads)
+    build_compiled(
+        *build_args,
+        state.num_candidate_q_tiles,
+        state.task_capacity,
+        state.num_heads,
+        state.max_page_chunk,
+    )
 
 
 class BatchPrefillIndexerQ8KV8Wrapper:
@@ -705,6 +713,22 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         total_rows = total_q * self._num_heads
         q_tile_capacity = -(-total_rows // q_tile) + batch - 1
         task_capacity = q_tile_capacity * -(-max_pages // _PREFILL_TASK_CAPACITY_PAGE_CHUNK)
+        # On SM107, cap the planner's page chunk so every Q tile splits into at
+        # most clusters // q_tiles tasks: short-query batches then fill the
+        # machine in one wave instead of leaving most clusters idle. Host-known
+        # upper bounds only (no D2H); long-query batches keep the default chunk.
+        if _require_supported_device(device) == (10, 7):
+            num_clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
+            chunks_per_q_tile = max(1, num_clusters // q_tile_capacity)
+            max_page_chunk = max(
+                Q8KV8PrefillIndexerPlanBuild.min_page_chunk,
+                min(
+                    Q8KV8PrefillIndexerPlanBuild.large_page_chunk,
+                    -(-max_pages // chunks_per_q_tile),
+                ),
+            )
+        else:
+            max_page_chunk = Q8KV8PrefillIndexerPlanBuild.large_page_chunk
         options = {"device": device}
         self._state = _PrefillPlanState(
             cu_seqlens_q=cu_seqlens_q,
@@ -725,6 +749,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
             num_candidate_q_tiles=batch * -(-max_seqlen_q * self._num_heads // q_tile),
+            max_page_chunk=max_page_chunk,
             total_q=total_q,
             num_heads=self._num_heads,
             scores=torch.empty((total_rows, max_pages), dtype=torch.float32, **options),
