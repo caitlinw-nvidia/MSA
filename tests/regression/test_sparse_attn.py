@@ -6,6 +6,8 @@
 Uses PyTorch as reference: gather selected KV blocks, run dense attention.
 Covers varlen, shuffled pages, different page sizes, edge cases.
 """
+import contextlib
+import functools
 import math
 import random
 import torch
@@ -107,12 +109,16 @@ def _run_sparse_varlen(name, seed, batch_size, num_kv_heads, num_qo_heads,
                        page_size=128, head_dim=128, shuffle_pages=False,
                        qo_lens=None, original_kv_lens=None, qo_offsets=None,
                        sparse_block_counts=None, max_sparse_blocks=16,
-                       num_kv_splits=-1, dtype=torch.bfloat16, interleaved_kv=False):
+                       num_kv_splits=-1, dtype=torch.bfloat16, interleaved_kv=False,
+                       output_scale=None):
     """Generic sparse attention test with full control over parameters.
 
     ``interleaved_kv`` stores K and V side by side in one paged cache
     ``[pages, Hkv, page_size, 2 * head_dim]`` and passes the kernel its strided
     K and V views.
+
+    ``output_scale`` passes a one-element FP32 tensor to ``sparse_atten_func``
+    and scales the reference by the same factor.
     """
     torch.manual_seed(seed)
     random.seed(seed)
@@ -213,16 +219,50 @@ def _run_sparse_varlen(name, seed, batch_size, num_kv_heads, num_qo_heads,
                        qo_offsets, head_dim, dev)
 
     # FlashInfer
-    out = run_sparse_flashinfer(
-        q, k_pages_for_kernel, v_pages_for_kernel,
-        qo_lens, original_kv_lens, qo_offsets,
-        kv_indices, pages_per_batch, kv_block_indexes, kv_block_num,
-        num_qo_heads, page_size, head_dim, dev,
-        num_kv_splits=num_kv_splits, dtype=dtype,
-    )
+    scale_tensor = (None if output_scale is None else
+                    torch.tensor([output_scale], dtype=torch.float32, device=dev))
+    with _inject_output_scale(scale_tensor):
+        out = run_sparse_flashinfer(
+            q, k_pages_for_kernel, v_pages_for_kernel,
+            qo_lens, original_kv_lens, qo_offsets,
+            kv_indices, pages_per_batch, kv_block_indexes, kv_block_num,
+            num_qo_heads, page_size, head_dim, dev,
+            num_kv_splits=num_kv_splits, dtype=dtype,
+        )
 
     threshold = 0.9999 if dtype == torch.bfloat16 else 0.999
-    return check(name, out, o_ref, threshold)
+    if output_scale is None:
+        return check(name, out, o_ref, threshold)
+    # Cosine similarity ignores scale, so also check the output magnitude.
+    o_ref = (o_ref.float() * output_scale).to(torch.bfloat16)
+    passed = check(name, out, o_ref, threshold)
+    return check_norm_ratio(name, out, o_ref) and passed
+
+
+def check_norm_ratio(name, o, o_ref, tolerance=0.01):
+    valid = ~o_ref.isnan()
+    ratio = (o[valid].float().norm() / o_ref[valid].float().norm()).item()
+    passed = abs(ratio - 1.0) < tolerance
+    print(f"  [{'PASS' if passed else 'FAIL'}] {name}: norm_ratio={ratio:.6f}")
+    if not passed:
+        failed_cases.append(f"{name}: norm_ratio={ratio:.6f}")
+    return passed
+
+
+@contextlib.contextmanager
+def _inject_output_scale(output_scale):
+    """Pass ``output_scale`` through the adapter's ``sparse_atten_func`` call."""
+    if output_scale is None:
+        yield
+        return
+    import fmha_sm100.sparse_fmha_adapter as adapter
+
+    sparse_atten_func = adapter.sparse_atten_func
+    adapter.sparse_atten_func = functools.partial(sparse_atten_func, output_scale=output_scale)
+    try:
+        yield
+    finally:
+        adapter.sparse_atten_func = sparse_atten_func
 
 
 if __name__ == "__main__":
@@ -414,6 +454,39 @@ if __name__ == "__main__":
         if fp8_port_calls != 6:
             all_pass = False
             failed_cases.append(f"interleaved_kv: Blackwell port served {fp8_port_calls}/6 FP8 calls")
+
+    print("\n=== 18. output_scale on the Blackwell prefill port ===")
+    # Eligible calls with an output_scale must stay on the port and scale the output.
+    port_q_dtypes.clear()
+    blackwell_prefill.run_pagekv = recording_run_pagekv
+    try:
+        for dt in dtypes:
+            for scale in (0.5, 2.0):
+                for B, hk, hq, desc in [(2, 2, 16, "GQA8"), (2, 1, 16, "GQA16")]:
+                    all_pass &= _run_sparse_varlen(
+                        f"output_scale={scale} {desc} {dt}", 7, B, hk, hq,
+                        shuffle_pages=True, dtype=dt, interleaved_kv=True,
+                        output_scale=scale,
+                    )
+    finally:
+        blackwell_prefill.run_pagekv = run_pagekv
+    if _supports_blackwell_prefill(torch.device("cuda"), topk=16):
+        port_calls = len(port_q_dtypes)
+        print(f"  Blackwell port served {port_calls}/8 output_scale calls")
+        if port_calls != 8:
+            all_pass = False
+            failed_cases.append(f"output_scale: Blackwell port served {port_calls}/8 calls")
+        # The port's combine rejects a non-FP32 scale, as the original combine does.
+        bad_scale = torch.tensor([1.0], dtype=torch.float64, device="cuda")
+        try:
+            with _inject_output_scale(bad_scale):
+                _run_sparse_varlen("bad output_scale", 7, 2, 1, 16,
+                                   dtype=torch.float8_e4m3fn, interleaved_kv=True)
+        except TypeError as error:
+            print(f"  [PASS] float64 output_scale: {error}")
+        else:
+            all_pass = False
+            failed_cases.append("output_scale: float64 scale did not raise TypeError")
 
     print()
     total = len(failed_cases)

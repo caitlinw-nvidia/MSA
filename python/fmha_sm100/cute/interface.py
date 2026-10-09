@@ -642,7 +642,6 @@ def _try_blackwell_sparse_prefill(
     if (not causal or schedule is None or page_table is None
             or partial_dtype != torch.bfloat16
             or return_softmax_lse or return_temperature_lse
-            or output_scale is not None
             or enable_fp16_softmax or enable_2x_fp8
             or qk_dtype != q.dtype or pv_dtype != q.dtype):
         return None
@@ -688,6 +687,7 @@ def _try_blackwell_sparse_prefill(
     blackwell_combine(
         partial, stats, out, None, cu_seqlens=cu_seqlens_q,
         split_counts=schedule.split_counts, use_pdl=True, raw_partial_stats=False,
+        output_scale=output_scale,
     )
     return out
 
