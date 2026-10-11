@@ -30,7 +30,7 @@ import torch
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
-from src.sm100.fwd.combine import combine
+from src.sm100.fwd.combine import combine, combine_f32f8
 from src.sm100.fwd.atten_fwd import SparseAttentionForwardSm100
 from src.sm100.fwd.atten_fwd_nvfp4_kv import SparseAttentionForwardNvfp4KvSm100
 from src.sm100.prepare_scheduler import (
@@ -56,6 +56,13 @@ _SUPPORTED_DECODE_QHEAD_PER_KV = 16
 
 def _to_cute_int32_metadata(t: torch.Tensor):
     return to_cute_tensor_kvouter(t, assumed_align=4)
+
+
+def _select_combine(partial_dtype: torch.dtype):
+    """The v1 combine takes BF16/FP16 partials; FP32 / FP8 E4M3 need combine_f32f8."""
+    if partial_dtype in (torch.bfloat16, torch.float16):
+        return combine
+    return combine_f32f8
 
 
 def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
@@ -642,7 +649,6 @@ def _try_blackwell_sparse_prefill(
     if (not causal or schedule is None or page_table is None
             or partial_dtype != torch.bfloat16
             or return_softmax_lse or return_temperature_lse
-            or output_scale is not None
             or enable_fp16_softmax or enable_2x_fp8
             or qk_dtype != q.dtype or pv_dtype != q.dtype):
         return None
@@ -674,7 +680,6 @@ def _try_blackwell_sparse_prefill(
     _validate_fwd_schedule(schedule, q=q, k2q_q_indices=k2q_q_indices, head_kv=k.shape[1])
 
     from src.blackwell_prefill.atten_fwd_sm100 import run_pagekv
-    from src.blackwell_prefill.combine import combine as blackwell_combine
 
     partial = torch.empty((topK, *q.shape), dtype=torch.bfloat16, device=q.device)
     stats = torch.empty((topK, *q.shape[:2]), dtype=torch.float32, device=q.device)
@@ -685,9 +690,10 @@ def _try_blackwell_sparse_prefill(
         k2q_row_ptr, k2q_q_indices, schedule, partial, stats,
         softmax_scale=softmax_scale, max_seqlen_q=max_seqlen_q, seqused_k=seqused_k,
     )
-    blackwell_combine(
+    combine(
         partial, stats, out, None, cu_seqlens=cu_seqlens_q,
         split_counts=schedule.split_counts, use_pdl=True, raw_partial_stats=False,
+        output_scale=output_scale,
     )
     return out
 
@@ -1131,7 +1137,7 @@ def sparse_atten_nvfp4_kv_func(
         kv_layout=kv_layout,
     )
 
-    combine(
+    _select_combine(O_partial.dtype)(
         O_partial,
         LSE_partial,
         O_out,
@@ -1702,7 +1708,7 @@ def _sparse_atten_csr_varlen_forward(
     )
     # Sparse Attention and Sparse Page Attention both use the varlen-Q
     # combine path; the kernel-written LSE_out is the final contract.
-    combine(
+    _select_combine(O_partial.dtype)(
         O_partial,
         LSE_partial,
         O_out,
