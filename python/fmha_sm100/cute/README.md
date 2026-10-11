@@ -442,6 +442,15 @@ prefill.plan(
 topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 4, 16] int32
 ```
 
+A caller that runs its own page selection (for example vLLM's shared TopK over
+decode and prefill rows) passes its score buffer to `plan` and scores without
+the TopK:
+
+```python
+prefill.plan(..., score_out=scores[rows_lo:rows_hi])  # fp32 [total_q * num_heads, >= max_pages]
+prefill.run_scores(index_q, index_k_cache)            # writes pages before each row's local page
+```
+
 ### Q8KV Input And Output Contract
 
 - `index_q`: `[num_tokens, num_heads, 128]`, `torch.float8_e4m3fn`,
