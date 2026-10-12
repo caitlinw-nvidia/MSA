@@ -140,6 +140,21 @@ class Q8KV4DecodeIndexerSm100:
         rubin_arch = getattr(arch.__class__, "sm_107", None)
         is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)
         self.use_qmul4 = _HAS_QMUL4 and not is_rubin
+        # SM107's FP16 dequant path needs more registers; without a register
+        # bound only one CTA fits per SM there and the grid runs in two waves.
+        self.min_blocks_per_mp = self.target_ctas_per_sm if is_rubin else 1
+        # The DSL sizes the shared-memory carveout from an explicit byte count
+        # whenever more than one block per SM is requested: the raw page ring,
+        # the Q tile, the partial maxima, the barriers and alignment slack.
+        self.smem_bytes = (
+            self.raw_stages * self.raw_page_bytes
+            + self.num_queries * self.head_dim
+            + 2 * self.score_warps * self.num_queries * Float32.width // 8
+            + 1024
+            + 2048
+            if is_rubin
+            else None
+        )
 
     @cute.jit
     def __call__(
@@ -302,7 +317,8 @@ class Q8KV4DecodeIndexerSm100:
             grid=(self.grid_ctas, 1, 1),
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
-            min_blocks_per_mp=1,
+            smem=self.smem_bytes,
+            min_blocks_per_mp=self.min_blocks_per_mp,
             use_pdl=True,
         )
 
