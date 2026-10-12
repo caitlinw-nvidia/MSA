@@ -333,31 +333,6 @@ class Q8KV4DecodeIndexerSm100:
         lane_idx = cute.arch.lane_idx()
         worker_idx, _, _ = cute.arch.block_idx()
 
-        total_pages = Int32(0)
-        if lane_idx == Int32(0):
-            total_pages = mScheduler[batch_size]
-        total_pages = cute.arch.shuffle_sync(total_pages, 0)
-        pages_per_worker = (total_pages + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
-        global_page_begin = worker_idx * pages_per_worker
-        num_pages = Int32(0)
-        if global_page_begin < total_pages:
-            global_page_end = global_page_begin + pages_per_worker
-            if global_page_end > total_pages:  # noqa: PLR1730
-                global_page_end = total_pages
-            num_pages = global_page_end - global_page_begin
-
-        batch_idx = Int32(0)
-        if lane_idx == Int32(0):
-            batch_hi = batch_size
-            while batch_idx < batch_hi:
-                batch_mid = (batch_idx + batch_hi) // Int32(2)
-                if mScheduler[batch_mid + 1] <= global_page_begin:
-                    batch_idx = batch_mid + Int32(1)
-                else:
-                    batch_hi = batch_mid
-        batch_idx = cute.arch.shuffle_sync(batch_idx, 0)
-        logical_page_begin = global_page_begin - mScheduler[batch_idx]
-
         if warp_idx == Int32(1):
             cpasync.prefetch_descriptor(tma_atom_packed)
             cpasync.prefetch_descriptor(tma_atom_scale)
@@ -473,6 +448,33 @@ class Q8KV4DecodeIndexerSm100:
         pipeline.pipeline_init_wait()
         # PDL: the predecessor writes q and the current pages of the index cache.
         cute.arch.griddepcontrol_wait()
+        # The plan writes the scheduler prefix sums just before this launch, so
+        # they are read only after the PDL wait. Lane 0 of every warp reads
+        # them; a read before the wait could give warps different page counts.
+        total_pages = Int32(0)
+        if lane_idx == Int32(0):
+            total_pages = mScheduler[batch_size]
+        total_pages = cute.arch.shuffle_sync(total_pages, 0)
+        pages_per_worker = (total_pages + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
+        global_page_begin = worker_idx * pages_per_worker
+        num_pages = Int32(0)
+        if global_page_begin < total_pages:
+            global_page_end = global_page_begin + pages_per_worker
+            if global_page_end > total_pages:  # noqa: PLR1730
+                global_page_end = total_pages
+            num_pages = global_page_end - global_page_begin
+
+        batch_idx = Int32(0)
+        if lane_idx == Int32(0):
+            batch_hi = batch_size
+            while batch_idx < batch_hi:
+                batch_mid = (batch_idx + batch_hi) // Int32(2)
+                if mScheduler[batch_mid + 1] <= global_page_begin:
+                    batch_idx = batch_mid + Int32(1)
+                else:
+                    batch_hi = batch_mid
+        batch_idx = cute.arch.shuffle_sync(batch_idx, 0)
+        logical_page_begin = global_page_begin - mScheduler[batch_idx]
         thr_mma = tiled_mma.get_slice(0)
         tmem_ptr = tmem.retrieve_ptr(Float32)
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
