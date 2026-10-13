@@ -485,6 +485,11 @@ _MODULES = {
                                    ("q8kv4_indexer_decode_sm107.cu",),
                                    {"fast_math": False, "archs": ("107a",)},
                                    " -Xcompiler -fvisibility=hidden"),
+    # uGPU-locality experiment: the one-head kernel with the domain parity split.
+    "q8kv4_indexer_decode_sm107_parity": ("q8kv4_indexer_decode_sm107_parity",
+                                          ("q8kv4_indexer_decode_sm107_parity.cu",),
+                                          {"fast_math": False, "archs": ("107a",)},
+                                          " -Xcompiler -fvisibility=hidden"),
 }
 # The modules get_indexer_module loads.
 _INDEXER_MODULE_SOURCES = ("indexer_topk_select", "q8kv4_indexer_decode")
