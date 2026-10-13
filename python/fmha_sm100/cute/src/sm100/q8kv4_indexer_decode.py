@@ -140,6 +140,9 @@ class Q8KV4DecodeIndexerSm100:
         rubin_arch = getattr(arch.__class__, "sm_107", None)
         is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)
         self.use_qmul4 = _HAS_QMUL4 and not is_rubin
+        # SM107's FP16 dequant path needs more registers; without a register
+        # bound only one CTA fits per SM there and the grid runs in two waves.
+        self.min_blocks_per_mp = self.target_ctas_per_sm if is_rubin else 1
 
     @cute.jit
     def __call__(
@@ -270,6 +273,11 @@ class Q8KV4DecodeIndexerSm100:
             (self.head_dim, self.num_queries),
         )
 
+        sPartialMax_layout = cute.make_layout(
+            (2, self.score_warps, self.num_queries),
+            stride=(self.score_warps * self.num_queries, self.num_queries, 1),
+        )
+
         @cute.struct
         class SharedStorage:
             raw_mbar_ptr: cute.struct.MemRange[Int64, self.raw_stages * 2]
@@ -277,8 +285,23 @@ class Q8KV4DecodeIndexerSm100:
             q_mbar_ptr: cute.struct.MemRange[Int64, 2]
             acc_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stages * 2]
             tmem_holding_buf: Int32
+            sPacked: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, cute.cosize(sPacked_layout)], 1024
+            ]
+            sScale: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, cute.cosize(sScale_layout)], 128
+            ]
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(sQ_layout)], 128
+            ]
+            sPartialMax: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(sPartialMax_layout)], 16
+            ]
 
         self.shared_storage = SharedStorage
+        # The DSL sizes the shared-memory carveout from an explicit byte count
+        # whenever more than one block per SM is requested.
+        smem_bytes = SharedStorage.size_in_bytes() if self.min_blocks_per_mp > 1 else None
         self.kernel(
             tiled_mma,
             tma_atom_packed,
@@ -298,11 +321,13 @@ class Q8KV4DecodeIndexerSm100:
             tK_layout,
             sQ_layout,
             sQ_tma_layout,
+            sPartialMax_layout,
         ).launch(
             grid=(self.grid_ctas, 1, 1),
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
-            min_blocks_per_mp=1,
+            smem=smem_bytes,
+            min_blocks_per_mp=self.min_blocks_per_mp,
             use_pdl=True,
         )
 
@@ -327,36 +352,12 @@ class Q8KV4DecodeIndexerSm100:
         tK_layout: cute.ComposedLayout,
         sQ_layout: cute.ComposedLayout,
         sQ_tma_layout: cute.ComposedLayout,
+        sPartialMax_layout: cute.Layout,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()
         worker_idx, _, _ = cute.arch.block_idx()
-
-        total_pages = Int32(0)
-        if lane_idx == Int32(0):
-            total_pages = mScheduler[batch_size]
-        total_pages = cute.arch.shuffle_sync(total_pages, 0)
-        pages_per_worker = (total_pages + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
-        global_page_begin = worker_idx * pages_per_worker
-        num_pages = Int32(0)
-        if global_page_begin < total_pages:
-            global_page_end = global_page_begin + pages_per_worker
-            if global_page_end > total_pages:  # noqa: PLR1730
-                global_page_end = total_pages
-            num_pages = global_page_end - global_page_begin
-
-        batch_idx = Int32(0)
-        if lane_idx == Int32(0):
-            batch_hi = batch_size
-            while batch_idx < batch_hi:
-                batch_mid = (batch_idx + batch_hi) // Int32(2)
-                if mScheduler[batch_mid + 1] <= global_page_begin:
-                    batch_idx = batch_mid + Int32(1)
-                else:
-                    batch_hi = batch_mid
-        batch_idx = cute.arch.shuffle_sync(batch_idx, 0)
-        logical_page_begin = global_page_begin - mScheduler[batch_idx]
 
         if warp_idx == Int32(1):
             cpasync.prefetch_descriptor(tma_atom_packed)
@@ -366,32 +367,11 @@ class Q8KV4DecodeIndexerSm100:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        sPacked = smem.allocate_tensor(
-            element_type=cutlass.Uint8,
-            layout=sPacked_layout.outer,
-            swizzle=sPacked_layout.inner,
-            byte_alignment=1024,
-        )
-        sScale = smem.allocate_tensor(
-            element_type=cutlass.Uint8,
-            layout=sScale_layout,
-            byte_alignment=128,
-        )
-        sQ = smem.allocate_tensor(
-            element_type=cutlass.Float8E4M3FN,
-            layout=sQ_layout.outer,
-            swizzle=sQ_layout.inner,
-            byte_alignment=128,
-        )
+        sPacked = storage.sPacked.get_tensor(sPacked_layout.outer, swizzle=sPacked_layout.inner)
+        sScale = storage.sScale.get_tensor(sScale_layout)
+        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sQ_tma = cute.make_tensor(sQ.iterator, sQ_tma_layout.outer)
-        sPartialMax = smem.allocate_tensor(
-            element_type=Float32,
-            layout=cute.make_layout(
-                (2, self.score_warps, self.num_queries),
-                stride=(self.score_warps * self.num_queries, self.num_queries, 1),
-            ),
-            byte_alignment=16,
-        )
+        sPartialMax = storage.sPartialMax.get_tensor(sPartialMax_layout)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(_NamedBarrier.TmemPtr),
@@ -473,6 +453,33 @@ class Q8KV4DecodeIndexerSm100:
         pipeline.pipeline_init_wait()
         # PDL: the predecessor writes q and the current pages of the index cache.
         cute.arch.griddepcontrol_wait()
+        # The plan writes the scheduler prefix sums just before this launch, so
+        # they are read only after the PDL wait. Lane 0 of every warp reads
+        # them; a read before the wait could give warps different page counts.
+        total_pages = Int32(0)
+        if lane_idx == Int32(0):
+            total_pages = mScheduler[batch_size]
+        total_pages = cute.arch.shuffle_sync(total_pages, 0)
+        pages_per_worker = (total_pages + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
+        global_page_begin = worker_idx * pages_per_worker
+        num_pages = Int32(0)
+        if global_page_begin < total_pages:
+            global_page_end = global_page_begin + pages_per_worker
+            if global_page_end > total_pages:  # noqa: PLR1730
+                global_page_end = total_pages
+            num_pages = global_page_end - global_page_begin
+
+        batch_idx = Int32(0)
+        if lane_idx == Int32(0):
+            batch_hi = batch_size
+            while batch_idx < batch_hi:
+                batch_mid = (batch_idx + batch_hi) // Int32(2)
+                if mScheduler[batch_mid + 1] <= global_page_begin:
+                    batch_idx = batch_mid + Int32(1)
+                else:
+                    batch_hi = batch_mid
+        batch_idx = cute.arch.shuffle_sync(batch_idx, 0)
+        logical_page_begin = global_page_begin - mScheduler[batch_idx]
         thr_mma = tiled_mma.get_slice(0)
         tmem_ptr = tmem.retrieve_ptr(Float32)
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
