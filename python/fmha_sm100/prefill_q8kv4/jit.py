@@ -132,7 +132,7 @@ class JitSpec:
     q_heads_per_kv: int = 16
     head_dim: int = 128
     page_size: int = 128
-    q_stages: int = 3
+    q_stages: int = 8
     score_stages: int = 2
 
     @property
@@ -162,6 +162,7 @@ class JitSpec:
             "sources": [
                 str(_API / "prefill_attention_api.cpp"),
                 str(_API / "prefill_attention_binding.cpp"),
+                str(_API / "locality_domains.cu"),
                 str(cache_dir / "prefill_attention_inst.cu"),
             ],
             "extra_include_paths": [
@@ -188,6 +189,9 @@ class JitSpec:
                 f"-gencode=arch=compute_{self.target_arch},code=sm_{self.target_arch}",
                 shift_define,
                 f"-DFMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4={has_qmul4}",
+                # Seen by the host and device passes alike (the cute arch macros are device-only),
+                # so the kernel instantiation the host registers is the one the cubin holds.
+                f"-DFMHA_SM100_PREFILL_Q8KV4_SM107={int(self.target_arch == '107a')}",
             ],
             "extra_ldflags": ["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
         }

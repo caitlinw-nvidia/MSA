@@ -20,6 +20,7 @@ Preprocessing (external, done once):
         -> k2q_q_indices [head_kv, total_q * topK]  int32
 """
 
+import functools
 import math
 import os
 from typing import Optional
@@ -58,11 +59,12 @@ def _to_cute_int32_metadata(t: torch.Tensor):
     return to_cute_tensor_kvouter(t, assumed_align=4)
 
 
-def _select_combine(partial_dtype: torch.dtype):
-    """The v1 combine takes BF16/FP16 partials; FP32 / FP8 E4M3 need combine_f32f8."""
+def _select_combine(partial_dtype: torch.dtype, cu_seqlens: torch.Tensor):
+    """BF16/FP16 partials run on the default combine, which schedules the flat varlen rows
+    by itself; FP32 / FP8 E4M3 partials run on combine_f32f8, which walks them by cu_seqlens."""
     if partial_dtype in (torch.bfloat16, torch.float16):
         return combine
-    return combine_f32f8
+    return functools.partial(combine_f32f8, cu_seqlens=cu_seqlens)
 
 
 def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
@@ -691,9 +693,8 @@ def _try_blackwell_sparse_prefill(
         softmax_scale=softmax_scale, max_seqlen_q=max_seqlen_q, seqused_k=seqused_k,
     )
     combine(
-        partial, stats, out, None, cu_seqlens=cu_seqlens_q,
-        split_counts=schedule.split_counts, use_pdl=True, raw_partial_stats=False,
-        output_scale=output_scale,
+        partial, stats, out, None,
+        split_counts=schedule.split_counts, use_pdl=True, output_scale=output_scale,
     )
     return out
 
@@ -774,8 +775,8 @@ def sparse_atten_func(
         ``softmax_scale / lse_temperature_scale``.  Requires
         ``return_softmax_lse=True``.
     partial_dtype : torch.dtype, optional
-        Accumulation dtype for per-block partial O.  Supported values are
-        FP32, BF16, FP16, and FP8 E4M3.
+        Storage dtype of the per-block partial O: FP32, BF16, FP16 or FP8
+        E4M3; the combine accumulates them in FP32.
     return_softmax_lse : bool, optional
         If True, return ``(out, softmax_lse)`` or
         ``(out, softmax_lse, temperature_lse)``.
@@ -993,7 +994,8 @@ def sparse_atten_nvfp4_kv_func(
         If True, also return temperature-scaled LSE.  Requires
         ``return_softmax_lse=True``.
     partial_dtype : torch.dtype, optional
-        Accumulation dtype for per-block partial O.
+        Storage dtype of the per-block partial O: FP32, BF16, FP16 or FP8
+        E4M3; the combine accumulates them in FP32.
     return_softmax_lse : bool, optional
         If True, return LSE together with the output.
     page_table : torch.Tensor, optional
@@ -1137,14 +1139,13 @@ def sparse_atten_nvfp4_kv_func(
         kv_layout=kv_layout,
     )
 
-    _select_combine(O_partial.dtype)(
+    _select_combine(O_partial.dtype, cu_seqlens_q)(
         O_partial,
         LSE_partial,
         O_out,
         LSE_out,
         lse_temperature_partial=LSE_temperature_partial,
         lse_temperature_out=LSE_temperature_out,
-        cu_seqlens=cu_seqlens_q,
         split_counts=split_counts,
         output_scale=v_global_scale,
         use_pdl=True,
@@ -1708,14 +1709,13 @@ def _sparse_atten_csr_varlen_forward(
     )
     # Sparse Attention and Sparse Page Attention both use the varlen-Q
     # combine path; the kernel-written LSE_out is the final contract.
-    _select_combine(O_partial.dtype)(
+    _select_combine(O_partial.dtype, cu_seqlens_q)(
         O_partial,
         LSE_partial,
         O_out,
         LSE_out,
         lse_temperature_partial=LSE_temperature_partial,
         lse_temperature_out=LSE_temperature_out,
-        cu_seqlens=cu_seqlens_q,
         split_counts=split_counts,
         use_pdl=True,
         output_scale=output_scale,
