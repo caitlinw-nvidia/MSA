@@ -21,7 +21,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync
-from cutlass.cute.typing import Float32, Int32, Int64
+from cutlass.cute.typing import Float16, Float32, Int32, Int64
 from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
 
 import cuda.bindings.driver as cuda
@@ -127,6 +127,59 @@ def _e2m1x8_f16x2_scaled_to_e4m3x8(
     )
 
 
+@dsl_user_op
+def _e2m1x8_f16x2_scaled_to_f16x8(
+    packed: Int32, scale_f16x2: Int32, *, loc=None, ip=None
+) -> tuple[Int32, Int32, Int32, Int32]:
+    """Eight E2M1 values times an f16x2 block scale, kept as four f16x2 words (exact)."""
+
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(packed).ir_value(loc=loc, ip=ip), Int32(scale_f16x2).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n\t"
+        "mov.b32 {byte0, byte1, byte2, byte3}, $4;\n\t"
+        "cvt.rn.f16x2.e2m1x2 $0, byte0;\n\t"
+        "cvt.rn.f16x2.e2m1x2 $1, byte1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 $2, byte2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 $3, byte3;\n\t"
+        "mul.rn.f16x2 $0, $0, $5;\n\t"
+        "mul.rn.f16x2 $1, $1, $5;\n\t"
+        "mul.rn.f16x2 $2, $2, $5;\n\t"
+        "mul.rn.f16x2 $3, $3, $5;\n\t"
+        "}\n",
+        "=r,=r,=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _e4m3x4_to_f16x4(word: Int32, *, loc=None, ip=None) -> tuple[Int32, Int32]:
+    """Widen four packed E4M3 values to two f16x2 words (exact)."""
+
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(word).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 lo, hi;\n\t"
+        "mov.b32 {lo, hi}, $2;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $1, hi;\n\t"
+        "}\n",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Int32(llvm.extractvalue(T.i32(), out, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(T.i32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
 class _NamedBarrier(enum.IntEnum):
     TmemPtr = enum.auto()
     Score = enum.auto()
@@ -190,6 +243,19 @@ class Q8KV4DecodeIndexerSm100:
     q_loader_warp = 2
     merge_q_loader = False
     empty_cta_pages = -1
+    # SM107 (set in __init__): the dequantized K stays FP16 in TMEM and the QK MMA
+    # is kind::f16. SM107's dequant has to go through FP16 anyway (ptxas rejects
+    # QMUL4 there); rounding the products back to E4M3 for an FP8 MMA cost a third
+    # of the dequant instructions and up to ~8% per-score error, while the FP8 MMA
+    # rate was never the limiter. q stays E4M3 at the interface: the MMA warp
+    # widens it into shared memory right before its first MMA of a segment.
+    use_fp16_mma = False
+    split_tmem = False
+    tmem_cols_k = 0
+    tmem_cols_acc = 0
+    k_dtype = cutlass.Float8E4M3FN
+    k_per_tmem_col = e4m3_per_tmem_col
+    dequant_store_halves = 1
 
     def __init__(self, *, sm_count: int, num_heads: int) -> None:
         if sm_count <= 0:
@@ -214,18 +280,42 @@ class Q8KV4DecodeIndexerSm100:
             self.target_ctas_per_sm = 3
             self.empty_cta_pages = 0
             self.raw_stages = 7
+            self.use_fp16_mma = True
+        if self.use_fp16_mma:
+            if not is_rubin:
+                raise NotImplementedError("the FP16 K / kind::f16 path is implemented for SM107")
+            self.k_dtype = Float16
+            self.k_per_tmem_col = Float32.width // Float16.width
+            self.k_stage_tmem_cols = self.head_dim // self.k_per_tmem_col
+            # Keep the dequant register tile at 32 words: store each TMEM K stage in two halves.
+            self.dequant_store_halves = 2
         self.acc_tmem_cols = self.acc_stages * self.num_queries
         # The allocation is a power of two of at least 32 columns: 128 for both
         # two heads (2 * 16 + 2 * 32 columns) and four heads (2 * 32 + 2 * 32).
         used_tmem_cols = self.acc_tmem_cols + self.k_stages * self.k_stage_tmem_cols
         self.tmem_cols = max(32, 1 << (used_tmem_cols - 1).bit_length())
+        if self.use_fp16_mma:
+            # FP16 K stages are 128 columns. SM107 has 576 TMEM columns (SM100/SM103:
+            # 512): two allocations (K stages, accumulators: 160/192 per CTA) fit three
+            # CTAs where one power-of-two allocation (256) would allow only two.
+            self.split_tmem = True
+            self.tmem_cols_k = self.k_stages * self.k_stage_tmem_cols
+            self.tmem_cols_acc = max(32, 1 << (self.acc_tmem_cols - 1).bit_length())
+            per_cta = self.tmem_cols_k + self.tmem_cols_acc
+            if per_cta * self.target_ctas_per_sm > 576:
+                self.target_ctas_per_sm = 576 // per_cta
+            # FP16 doubles the Q stages (8 KB at four heads); one raw page stage less
+            # (9 KB) keeps three CTAs within the SM's shared memory. (One Q stage with
+            # seven raw stages measured 1.8% slower.)
+            if self.target_ctas_per_sm == 3 and self.num_heads == 4:
+                self.raw_stages = 6
         self.grid_ctas = sm_count * self.target_ctas_per_sm
         self.use_qmul4 = _HAS_QMUL4 and not is_rubin
         # SM107's FP16 dequant path needs more registers; without a register
         # bound only one CTA fits per SM there and the grid runs in two waves.
         self.min_blocks_per_mp = self.target_ctas_per_sm if is_rubin else 1
         # SM107 has a K=64 FP8 UMMA, two instructions per page instead of four.
-        self.use_sm107_fp8_mma = is_rubin
+        self.use_sm107_fp8_mma = is_rubin and not self.use_fp16_mma
         # One scale byte covers two packed words, so SM107 converts each of a
         # row's eight scales to f16x2 once per page instead of once per word.
         self.hoist_scale_cvt = is_rubin and not self.use_qmul4
@@ -296,7 +386,19 @@ class Q8KV4DecodeIndexerSm100:
         qk_tiler = (self.m_tile, self.n_tile, self.k_tile)
         cta_group = tcgen05.CtaGroup.ONE
         # Both operands are K-major: dequantized K rows in TMEM and Q rows.
-        if cutlass.const_expr(self.use_sm107_fp8_mma):
+        if cutlass.const_expr(self.use_fp16_mma):
+            tiled_mma = cute.make_tiled_mma(
+                tcgen05.MmaF16BF16Op(
+                    Float16,
+                    Float32,
+                    (self.m_tile, self.n_tile, 16),
+                    cta_group,
+                    tcgen05.OperandSource.TMEM,
+                    OperandMajorMode.K,
+                    OperandMajorMode.K,
+                )
+            )
+        elif cutlass.const_expr(self.use_sm107_fp8_mma):
             tiled_mma = cute.make_tiled_mma(
                 tcgen05.SM107MmaFP8Op(
                     cutlass.Float8E4M3FN,
@@ -323,15 +425,17 @@ class Q8KV4DecodeIndexerSm100:
         tK_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
             qk_tiler,
-            cutlass.Float8E4M3FN,
+            self.k_dtype,
             1,
         )
         sQ_layout = sm100_utils.make_smem_layout_b(
             tiled_mma,
             qk_tiler,
-            mQ.element_type,
+            self.k_dtype,
             self.q_stages,
         )
+        # On the FP16-K path the loader warp widens q into sQ itself; this TMA
+        # layout and atom are then unused but still built (E4M3 gmem, 128B rows).
         sQ_tma_layout = cute.make_composed_layout(
             sQ_layout.inner,
             0,
@@ -385,14 +489,18 @@ class Q8KV4DecodeIndexerSm100:
             q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stages * 2]
             acc_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stages * 2]
             tmem_holding_buf: Int32
+            tmem_holding_buf2: Int32
             sPacked: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint8, cute.cosize(sPacked_layout)], 1024
             ]
             sScale: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint8, cute.cosize(sScale_layout)], 128
             ]
+            # 1024-byte aligned so the layout's 128B swizzle (applied to offsets from the
+            # buffer base by the FP16-path q widen) coincides with the hardware's, which
+            # permutes on absolute shared-memory address bits.
             sQ: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(sQ_layout)], 128
+                cute.struct.MemRange[self.k_dtype, cute.cosize(sQ_layout)], 1024
             ]
             sPartialMax: cute.struct.Align[
                 cute.struct.MemRange[Float32, cute.cosize(sPartialMax_layout)], 16
@@ -410,6 +518,7 @@ class Q8KV4DecodeIndexerSm100:
             tma_tensor_scale,
             tma_atom_Q,
             tma_tensor_Q,
+            mQ_krb,
             mPageTable_lb,
             mSeqLens,
             mOut_pqb,
@@ -441,6 +550,7 @@ class Q8KV4DecodeIndexerSm100:
         mKScale: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
         mQ_krb: cute.Tensor,
+        mQ_raw: cute.Tensor,
         mPageTable_lb: cute.Tensor,
         mSeqLens: cute.Tensor,
         mOut_pqb: cute.Tensor,
@@ -473,6 +583,17 @@ class Q8KV4DecodeIndexerSm100:
         sScale = storage.sScale.get_tensor(sScale_layout)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sQ_tma = cute.make_tensor(sQ.iterator, sQ_tma_layout.outer)
+        if cutlass.const_expr(self.use_fp16_mma):
+            # The MMA warp's store view of sQ: ((8-element vector, 16-byte chunk, 64-element
+            # atom half), query row, stage), the same bytes and the same swizzle as sQ_layout;
+            # this view only exposes the 16-byte vector the widen stores.
+            sQ_vec = storage.sQ.get_tensor(
+                cute.make_layout(
+                    ((8, 8, self.head_dim // 64), self.num_queries, self.q_stages),
+                    stride=((1, 8, 64 * self.num_queries), 64, self.num_queries * self.head_dim),
+                ),
+                swizzle=sQ_layout.inner,
+            )
         sPartialMax = storage.sPartialMax.get_tensor(sPartialMax_layout)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -487,7 +608,16 @@ class Q8KV4DecodeIndexerSm100:
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
         )
-        tmem.allocate(self.tmem_cols)
+        if cutlass.const_expr(self.split_tmem):
+            # K stages first (the larger, 128-column-aligned block), then accumulators.
+            tmem.allocate(self.tmem_cols_k)
+            tmem_acc = utils.TmemAllocator(
+                storage.tmem_holding_buf2,
+                barrier_for_retrieve=tmem_alloc_barrier,
+            )
+            tmem_acc.allocate(self.tmem_cols_acc)
+        else:
+            tmem.allocate(self.tmem_cols)
         # Release the permit right away so the other CTA on the SM can allocate.
         tmem.relinquish_alloc_permit()
 
@@ -509,14 +639,25 @@ class Q8KV4DecodeIndexerSm100:
             barrier_storage=storage.k_mbar_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
-        q_producer, q_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.q_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            tx_count=self.num_queries * self.head_dim,
-            barrier_storage=storage.q_mbar_ptr.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
+        if cutlass.const_expr(self.use_fp16_mma):
+            # The MMA warp both fills sQ and consumes it through its own MMAs, so
+            # the stage ring needs only the "empty" side of a pipeline: one
+            # mbarrier per stage, released by the UMMA commit of the MMAs that
+            # read it. The warp tracks it with a producer PipelineState.
+            q_stage_empty = pipeline.MbarrierArray(
+                storage.q_mbar_ptr.data_ptr(),
+                self.q_stages,
+                (pipeline.PipelineOp.TCGen05Mma, pipeline.CooperativeGroup(pipeline.Agent.Thread)),
+            )
+        else:
+            q_producer, q_consumer = pipeline.PipelineTmaUmma.create(
+                num_stages=self.q_stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                tx_count=self.num_queries * self.head_dim,
+                barrier_storage=storage.q_mbar_ptr.data_ptr(),
+                defer_sync=True,
+            ).make_participants()
         acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -584,21 +725,27 @@ class Q8KV4DecodeIndexerSm100:
         logical_page_begin = global_page_begin - mScheduler[batch_idx]
         thr_mma = tiled_mma.get_slice(0)
         tmem_ptr = tmem.retrieve_ptr(Float32)
-        tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+        if cutlass.const_expr(self.split_tmem):
+            acc_ptr = tmem_acc.retrieve_ptr(Float32)
+            k_col_offset = 0
+        else:
+            acc_ptr = tmem_ptr
+            k_col_offset = self.acc_tmem_cols
+        tCtAcc_staged = cute.make_tensor(acc_ptr, tCtAcc_fake.layout)
         # TMEM K stages follow the accumulators. The TMEM A fragment starts at
         # column 0 rather than at the input tensor, so rebase it onto this
         # CTA's allocation; fragment offsets count E4M3 values.
         tCrK_base = tiled_mma.make_fragment_A(cute.make_tensor(tmem_ptr, tK_layout.outer))[
             None, None, None, 0
         ]
-        k_tmem_col = tmem_ptr.toint() + Int32(self.acc_tmem_cols)
+        k_tmem_col = tmem_ptr.toint() + Int32(k_col_offset)
         tCrK = cute.make_tensor(
-            tCrK_base.iterator + k_tmem_col * Int32(self.e4m3_per_tmem_col),
+            tCrK_base.iterator + k_tmem_col * Int32(self.k_per_tmem_col),
             cute.append(
                 tCrK_base.layout,
                 cute.make_layout(
                     (self.k_stages,),
-                    stride=(self.k_stage_tmem_cols * self.e4m3_per_tmem_col,),
+                    stride=(self.k_stage_tmem_cols * self.k_per_tmem_col,),
                 ),
             ),
         )
@@ -606,6 +753,7 @@ class Q8KV4DecodeIndexerSm100:
         # the token row, each column packs four E4M3 values. A K stage is
         # k_stage_tmem_cols wide for any head count, so the view takes the C
         # layout of a (page_size, k_stage_tmem_cols) MMA, not the accumulator's.
+        store_cols = self.k_stage_tmem_cols // self.dequant_store_halves
         k_view_mma = sm100_utils.make_trivial_tiled_mma(
             cutlass.Float8E4M3FN,
             cutlass.Float8E4M3FN,
@@ -613,18 +761,21 @@ class Q8KV4DecodeIndexerSm100:
             OperandMajorMode.K,
             Float32,
             tcgen05.CtaGroup.ONE,
-            (self.m_tile, self.k_stage_tmem_cols),
+            (self.m_tile, store_cols),
             tcgen05.OperandSource.TMEM,
         )
         k_view_layout = k_view_mma.make_fragment_C(
-            k_view_mma.partition_shape_C((self.m_tile, self.k_stage_tmem_cols))
+            k_view_mma.partition_shape_C((self.m_tile, store_cols))
         ).layout
         tKtK = cute.make_tensor(
-            tmem_ptr + self.acc_tmem_cols,
+            tmem_ptr + k_col_offset,
             cute.append(
-                cute.composition(
-                    k_view_layout,
-                    cute.make_layout((self.page_size, self.k_stage_tmem_cols)),
+                cute.append(
+                    cute.composition(
+                        k_view_layout,
+                        cute.make_layout((self.page_size, store_cols)),
+                    ),
+                    cute.make_layout((self.dequant_store_halves,), stride=(store_cols,)),
                 ),
                 cute.make_layout((self.k_stages,), stride=(self.k_stage_tmem_cols,)),
             ),
@@ -657,7 +808,8 @@ class Q8KV4DecodeIndexerSm100:
                     segment_pages = mScheduler[current_batch + 1] - global_page
                     if segment_pages > pages_remaining:  # noqa: PLR1730
                         segment_pages = pages_remaining
-                    if cutlass.const_expr(self.merge_q_loader):
+                    # On the FP16 path the MMA warp widens q itself; the loader only streams pages.
+                    if cutlass.const_expr(self.merge_q_loader and not self.use_fp16_mma):
                         q_empty = q_producer.acquire_and_advance()
                         q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
                         sQ_stage = cute.make_tensor(
@@ -713,51 +865,59 @@ class Q8KV4DecodeIndexerSm100:
                         current_batch += Int32(1)
                         logical_page = global_page - mScheduler[current_batch]
                 raw_producer.tail()
-                if cutlass.const_expr(self.merge_q_loader):
+                if cutlass.const_expr(self.merge_q_loader and not self.use_fp16_mma):
                     q_producer.tail()
             elif warp_idx == Int32(self.q_loader_warp):
-                current_batch = batch_idx
-                global_page = global_page_begin
-                pages_remaining = num_pages
-                while pages_remaining > Int32(0):
-                    segment_pages = mScheduler[current_batch + 1] - global_page
-                    if segment_pages > pages_remaining:  # noqa: PLR1730
-                        segment_pages = pages_remaining
-                    q_empty = q_producer.acquire_and_advance()
-                    # Rows before the request belong to the previous one, or are
-                    # out of bounds and zero-filled for the first: they only fill
-                    # the unused leading slots.
-                    q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
-                    tQsQ, tQgQ = cpasync.tma_partition(
-                        tma_atom_Q,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sQ_tma, 0, 2),
-                        cute.group_modes(
-                            cute.flat_divide(
-                                cute.domain_offset((0, q_row), mQ_krb),
-                                (self.head_dim, self.num_queries),
-                            ),
+                # SM100/SM103 layout only; this branch is still traced on SM107.
+                if cutlass.const_expr(not self.use_fp16_mma):
+                    current_batch = batch_idx
+                    global_page = global_page_begin
+                    pages_remaining = num_pages
+                    while pages_remaining > Int32(0):
+                        segment_pages = mScheduler[current_batch + 1] - global_page
+                        if segment_pages > pages_remaining:  # noqa: PLR1730
+                            segment_pages = pages_remaining
+                        q_empty = q_producer.acquire_and_advance()
+                        # Rows before the request belong to the previous one, or are
+                        # out of bounds and zero-filled for the first: they only fill
+                        # the unused leading slots.
+                        q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
+                        tQsQ, tQgQ = cpasync.tma_partition(
+                            tma_atom_Q,
                             0,
-                            2,
-                        ),
-                    )
-                    cute.copy(
-                        tma_atom_Q,
-                        tQgQ[(None, 0, 0)],
-                        tQsQ,
-                        tma_bar_ptr=q_empty.barrier,
-                    )
-                    global_page += segment_pages
-                    pages_remaining -= segment_pages
-                    while (
-                        current_batch < batch_size - Int32(1)
-                        and mScheduler[current_batch + 1] <= global_page
-                    ):
-                        current_batch += Int32(1)
-                q_producer.tail()
+                            cute.make_layout(1),
+                            cute.group_modes(sQ_tma, 0, 2),
+                            cute.group_modes(
+                                cute.flat_divide(
+                                    cute.domain_offset((0, q_row), mQ_krb),
+                                    (self.head_dim, self.num_queries),
+                                ),
+                                0,
+                                2,
+                            ),
+                        )
+                        cute.copy(
+                            tma_atom_Q,
+                            tQgQ[(None, 0, 0)],
+                            tQsQ,
+                            tma_bar_ptr=q_empty.barrier,
+                        )
+                        global_page += segment_pages
+                        pages_remaining -= segment_pages
+                        while (
+                            current_batch < batch_size - Int32(1)
+                            and mScheduler[current_batch + 1] <= global_page
+                        ):
+                            current_batch += Int32(1)
+                    q_producer.tail()
             elif warp_idx == Int32(0):
                 num_k_blocks = cute.size(tCrK, mode=[2])
+                if cutlass.const_expr(self.use_fp16_mma):
+                    # Producer state: starts with phase 1, so the first use of each
+                    # sQ stage passes its empty wait without a prior commit.
+                    q_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer, self.q_stages
+                    )
                 current_batch = batch_idx
                 global_page = global_page_begin
                 pages_remaining = num_pages
@@ -765,7 +925,19 @@ class Q8KV4DecodeIndexerSm100:
                     segment_pages = mScheduler[current_batch + 1] - global_page
                     if segment_pages > pages_remaining:  # noqa: PLR1730
                         segment_pages = pages_remaining
-                    q_full = q_consumer.wait_and_advance()
+                    if cutlass.const_expr(self.use_fp16_mma):
+                        # Wait until the MMAs that last read this sQ stage have
+                        # committed, then widen the request's q into it and fence
+                        # the generic stores for the async proxy.
+                        q_stage_empty.wait(q_state.index, q_state.phase)
+                        q_index = q_state.index
+                        q_row = (current_batch + Int32(1)) * query_rows - Int32(self.num_queries)
+                        self._widen_q_stage(mQ_raw, sQ_vec, q_index, q_row, lane_idx)
+                        cute.arch.fence_view_async_shared()
+                        cute.arch.sync_warp()
+                    else:
+                        q_full = q_consumer.wait_and_advance()
+                        q_index = q_full.index
                     for _ in cutlass.range(segment_pages, unroll=1):
                         acc_empty = acc_producer.acquire_and_advance()
                         tCtAcc = tCtAcc_staged[(None, None, None, acc_empty.index)]
@@ -776,13 +948,18 @@ class Q8KV4DecodeIndexerSm100:
                                 tiled_mma,
                                 tCtAcc,
                                 tCrK[(None, None, k_block_idx, k_full.index)],
-                                tCrQ[(None, None, k_block_idx, q_full.index)],
+                                tCrQ[(None, None, k_block_idx, q_index)],
                                 tCtAcc,
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                         k_full.release()
                         acc_empty.commit()
-                    q_full.release()
+                    if cutlass.const_expr(self.use_fp16_mma):
+                        # UMMA commit releases the stage once this segment's MMAs are done.
+                        q_stage_empty.arrive(q_state.index, None, tcgen05.CtaGroup.ONE)
+                        q_state.advance()
+                    else:
+                        q_full.release()
                     global_page += segment_pages
                     pages_remaining -= segment_pages
                     while (
@@ -876,6 +1053,80 @@ class Q8KV4DecodeIndexerSm100:
 
         pipeline.sync(barrier_id=int(_NamedBarrier.Final))
         tmem.free(tmem_ptr)
+        if cutlass.const_expr(self.split_tmem):
+            tmem_acc.free(acc_ptr)
+
+    @cute.jit
+    def _widen_q_stage(
+        self,
+        mQ_krb: cute.Tensor,
+        sQ_vec: cute.Tensor,
+        stage: Int32,
+        q_row: Int32,
+        lane_idx: Int32,
+    ) -> None:
+        """MMA warp: E4M3 q rows [q_row, q_row + num_queries) -> FP16 sQ stage.
+
+        The warp is tiled as 8 lanes x 16 values along the head dimension and 4 rows
+        per step, so one tiled load reads the (head_dim, num_queries) q tile with
+        16-byte loads and one tiled store writes it to the stage with 16-byte stores.
+        Rows before 0 are the first request's unused leading slots: their loads are
+        predicated off and the fragment stays zero, as the TMA path's out-of-bounds
+        fill does. ``sQ_vec`` is the swizzled ((vector, chunk, atom half), row, stage)
+        view of sQ, so partitioning it places each 8-value store where TMA would have
+        put it and where the UMMA descriptor (SWIZZLE_128B, K-major) reads it.
+        """
+
+        lanes_per_row = self.head_dim // 16  # 16 E4M3 per 16-byte global chunk
+        thr_layout = cute.make_layout(
+            (lanes_per_row, 32 // lanes_per_row), stride=(1, lanes_per_row)
+        )
+        val_layout = cute.make_layout((16, 1))
+        tiled_load = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), mQ_krb.element_type, num_bits_per_copy=128
+            ),
+            thr_layout,
+            val_layout,
+        )
+        tiled_store = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float16, num_bits_per_copy=128),
+            thr_layout,
+            val_layout,
+        )
+        thr_load = tiled_load.get_slice(lane_idx)
+        thr_store = tiled_store.get_slice(lane_idx)
+
+        mQ_rows = cute.local_tile(
+            cute.domain_offset((0, q_row), mQ_krb), (self.head_dim, self.num_queries), (0, 0)
+        )
+        tQgQ = thr_load.partition_S(mQ_rows)  # ((16, 1), 1, rows / 4) E4M3
+        tQrQ = cute.make_fragment_like(tQgQ)
+        tQsQ = thr_store.partition_D(sQ_vec[(None, None, stage)])  # ((8, 2), 1, rows / 4) FP16
+        tQrQ16 = cute.make_fragment_like(tQsQ)
+
+        # Predicate on the row coordinate: rows before q_row + ... < 0 are not loaded.
+        cQ = cute.make_identity_tensor(mQ_rows.shape)
+        tQcQ = thr_load.partition_S(cQ)
+        tQpQ = cute.make_rmem_tensor(
+            (cute.size(tQcQ, mode=[0, 1]), cute.size(tQcQ, mode=[1]), cute.size(tQcQ, mode=[2])),
+            cutlass.Boolean,
+        )
+        for rest_v in cutlass.range_constexpr(cute.size(tQpQ, mode=[0])):
+            for m in cutlass.range_constexpr(cute.size(tQpQ, mode=[2])):
+                tQpQ[rest_v, 0, m] = q_row + tQcQ[(0, rest_v), 0, m][1] >= Int32(0)
+        tQrQ.fill(0)
+        cute.copy(tiled_load, tQgQ, tQrQ, pred=tQpQ)
+
+        # Widen in place: each lane's 16 E4M3 (4 words) of a row become 16 FP16 (8 words).
+        tQrQ_w = cute.recast_tensor(tQrQ, Int32)  # ((4, 1), 1, rows / 4)
+        tQrQ16_w = cute.recast_tensor(tQrQ16, Int32)  # ((4, 2), 1, rows / 4)
+        for m in cutlass.range_constexpr(cute.size(tQrQ_w, mode=[2])):
+            for w in cutlass.range_constexpr(4):
+                lo, hi = _e4m3x4_to_f16x4(tQrQ_w[((w, 0), 0, m)])
+                tQrQ16_w[(((2 * w) % 4, (2 * w) // 4), 0, m)] = lo
+                tQrQ16_w[(((2 * w + 1) % 4, (2 * w + 1) // 4), 0, m)] = hi
+        cute.copy(tiled_store, tQrQ16, tQsQ)
 
     @cute.jit
     def _dequant_pages(
@@ -890,16 +1141,17 @@ class Q8KV4DecodeIndexerSm100:
     ) -> None:
         """Expand raw NVFP4 pages into E4M3 TMEM K stages, one token row per thread."""
 
+        store_cols = self.k_stage_tmem_cols // self.dequant_store_halves
         tmem_store = tcgen05.make_tmem_copy(
             cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(self.k_stage_tmem_cols)),
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(store_cols)),
                 Float32,
             ),
-            tKtK[(None, None, 0)],
+            tKtK[(None, None, 0, 0)],
         ).get_slice(row)
         rK = cute.make_rmem_tensor(
             tmem_store.partition_S(
-                cute.make_identity_tensor((self.page_size, self.k_stage_tmem_cols))
+                cute.make_identity_tensor((self.page_size, store_cols))
             ).shape,
             Float32,
         )
@@ -962,18 +1214,32 @@ class Q8KV4DecodeIndexerSm100:
                     rScalesF16x2[group] = _e4m3_scale_to_f16x2(
                         rScales[group // word_bytes], group % word_bytes
                     )
-            for word in cutlass.range_constexpr(packed_words):
-                group = word * values_per_word // self.scale_group
-                scale = rScales[group // word_bytes] >> Int32(8 * (group % word_bytes))
-                if cutlass.const_expr(self.hoist_scale_cvt):
-                    lo, hi = _e2m1x8_f16x2_scaled_to_e4m3x8(rPacked[word], rScalesF16x2[group])
-                elif cutlass.const_expr(self.use_qmul4):
-                    lo, hi = _e2m1x8_scaled_to_e4m3x8(rPacked[word], scale)
-                else:
-                    lo, hi = common_utils.cvt_fp4x8_e2m1_scaled_e4m3x8(rPacked[word], scale)
-                rK_words[2 * word] = lo
-                rK_words[2 * word + 1] = hi
-            cute.copy(tmem_store, rK, tmem_store.partition_D(tKtK[(None, None, k_empty.index)]))
+            words_per_half = packed_words // self.dequant_store_halves
+            for half in cutlass.range_constexpr(self.dequant_store_halves):
+                for local_word in cutlass.range_constexpr(words_per_half):
+                    word = half * words_per_half + local_word
+                    group = word * values_per_word // self.scale_group
+                    scale = rScales[group // word_bytes] >> Int32(8 * (group % word_bytes))
+                    if cutlass.const_expr(self.use_fp16_mma):
+                        h0, h1, h2, h3 = _e2m1x8_f16x2_scaled_to_f16x8(
+                            rPacked[word], rScalesF16x2[group]
+                        )
+                        rK_words[4 * local_word] = h0
+                        rK_words[4 * local_word + 1] = h1
+                        rK_words[4 * local_word + 2] = h2
+                        rK_words[4 * local_word + 3] = h3
+                    else:
+                        if cutlass.const_expr(self.hoist_scale_cvt):
+                            lo, hi = _e2m1x8_f16x2_scaled_to_e4m3x8(rPacked[word], rScalesF16x2[group])
+                        elif cutlass.const_expr(self.use_qmul4):
+                            lo, hi = _e2m1x8_scaled_to_e4m3x8(rPacked[word], scale)
+                        else:
+                            lo, hi = common_utils.cvt_fp4x8_e2m1_scaled_e4m3x8(rPacked[word], scale)
+                        rK_words[2 * local_word] = lo
+                        rK_words[2 * local_word + 1] = hi
+                cute.copy(
+                    tmem_store, rK, tmem_store.partition_D(tKtK[(None, None, half, k_empty.index)])
+                )
             # Complete this thread's TMEM stores before one lane per warp
             # signals the stage to the MMA warp.
             cute.arch.fence_view_async_tmem_store()
