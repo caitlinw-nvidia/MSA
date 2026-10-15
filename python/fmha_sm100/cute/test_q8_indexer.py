@@ -54,6 +54,18 @@ E2M1_VALUES = (
     -6.0,
 )
 DECODE_FORMATS = ("q8kv8", "q8kv4")
+
+
+def _q8kv4_k_is_exact(num_heads: int) -> bool:
+    """Whether the Q8KV4 decode kernel keeps NVFP4 x E4M3-scale products exact.
+
+    Mirrors ``Q8KV4DecodeIndexerSm100.use_fp16_mma``: on SM107 the 2/4-head CuTe kernel
+    dequantizes K to FP16 and runs a kind::f16 MMA, so its scores are the exact products.
+    The one-head CUTLASS kernel and the SM100/SM103 kernels round the dequantized K to
+    E4M3 (saturating at 448) for an FP8 MMA.
+    """
+
+    return torch.cuda.get_device_capability() == (10, 7) and num_heads in (2, 4)
 DECODE_WRAPPERS = {"q8kv8": BatchDecodeIndexerQ8KV8Wrapper, "q8kv4": BatchDecodeIndexerQ8KV4Wrapper}
 DECODE_HEADS = {"q8kv8": (1, 2, 4), "q8kv4": (1, 2, 4)}
 DECODE_CASES = [(fmt, num_heads) for fmt in DECODE_FORMATS for num_heads in DECODE_HEADS[fmt]]
@@ -108,8 +120,19 @@ def _block_table(batch: int, max_pages: int, physical_pages: int, generator) -> 
 class _PagedK:
     """Logical K pages plus their vLLM cache encoding for one format."""
 
-    def __init__(self, fmt: str, physical_pages: int, generator, *, page_pad: int, k_scale: float):
+    def __init__(
+        self,
+        fmt: str,
+        physical_pages: int,
+        generator,
+        *,
+        page_pad: int,
+        k_scale: float,
+        exact_k: bool = False,
+    ):
         self.page_pad = page_pad
+        # Reference K for NVFP4: exact products (FP16 dequant path) or E4M3-rounded (FP8 path).
+        self.exact_k = exact_k
         if fmt == "q8kv8":
             self.set_fp8(_e4m3((physical_pages, PAGE_SIZE, HEAD_DIM), generator, k_scale))
         else:
@@ -164,9 +187,14 @@ class _PagedK:
         codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(
             physical_pages, PAGE_SIZE, HEAD_DIM
         )
-        # NVFP4 times the E4M3 block scale, saturated and rounded to E4M3.
         product = lut[codes.long()] * scale.float().repeat_interleave(16, dim=-1)
-        self.dequantized = product.clamp_(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).float()
+        if self.exact_k:
+            # FP16 dequant: NVFP4 times the E4M3 block scale has at most 7 significant
+            # bits, so the kernel's K is this product exactly, unclamped.
+            self.dequantized = product
+        else:
+            # FP8 dequant: the product saturated and rounded to E4M3 before the MMA.
+            self.dequantized = product.clamp_(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).float()
 
 
 def _page_scores(q_rows: torch.Tensor, k_pages: torch.Tensor) -> torch.Tensor:
@@ -279,7 +307,14 @@ def _make_decode(
     generator = _generator(seed)
     physical_pages = max_pages + 3
     q = _e4m3((batch * MTP, num_heads, HEAD_DIM), generator, q_scale)
-    k = _PagedK(fmt, physical_pages, generator, page_pad=page_pad, k_scale=k_scale)
+    k = _PagedK(
+        fmt,
+        physical_pages,
+        generator,
+        page_pad=page_pad,
+        k_scale=k_scale,
+        exact_k=fmt == "q8kv4" and _q8kv4_k_is_exact(num_heads),
+    )
     block_table = _block_table(batch, max_pages, physical_pages, generator)
     if seq_lens is None:
         seq_lens = _decode_lengths(batch, max_pages, seed)
