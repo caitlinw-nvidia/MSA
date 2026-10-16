@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module
-from .nvfp4_kv import nvfp4_head_slot_views
+from .nvfp4_kv import nvfp4_head_slot_views, nvfp4_kv_views
 from .sparse_fmha_adapter import sparse_fmha, sparse_fmha_plan
 from . import q8kv4_decode_adapter
 from . import q8kv4_prefill_adapter
@@ -768,16 +768,19 @@ def _fmha_sm100(
     output_maxscore: bool = True,
     output_o: bool = True,
     check_input_valid: bool = False,
+    k_sf: Optional[torch.Tensor] = None,
+    v_sf: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if plan_info["MM-SA-Nv"]:
         return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
                 sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale, o_scale=o_scale,
                 kv_indices=kv_indices, output_maxscore=output_maxscore, output_o=output_o, q_offset_override=q_offset_override,
-                kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid)
+                kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid,
+                k_sf=k_sf, v_sf=v_sf)
 
     is_nvfp4 = k.dtype == torch.uint8
     if is_nvfp4:
-        k, k_sf, v, v_sf = nvfp4_head_slot_views(k, v)
+        k, k_sf, v, v_sf = nvfp4_kv_views(k, v, k_sf, v_sf)
         k_global_scale, v_global_scale = k_scale, v_scale
         k_scale = v_scale = 1.0
         # Sparse NVFP4 decode runs on the Q8KV4 kernel when the plan carries one and the call
@@ -1204,6 +1207,12 @@ def fmha_sm100(
     packs two E2M1 values, and each block scale covers 16 values. K scales use
     ``token*8+group``; V scales use ``(token//4)*32+group*4+token%4`` within
     each head.
+    Alternatively pass the views yourself, for decode and prefill alike:
+    ``k``/``v`` as uint8 ``[pages, Hkv, 128, 64]`` data and ``k_sf``/``v_sf``
+    as uint8 ``[pages, Hkv, 128, 8]`` block scales (see ``nvfp4_kv_views``).
+    The kernels then take the page stride and the data and scale head strides
+    from the views, so any page layout whose per-head data and scale runs are
+    contiguous works.
     ``k_scale`` and ``v_scale`` are CUDA float32 scalar tensors for NVFP4:
     ``value = E2M1(code) * E4M3(block_scale) * global_scale``.
     Use BF16 or E4M3 Q for prefill and E4M3 Q for decode. No cache conversion is needed.

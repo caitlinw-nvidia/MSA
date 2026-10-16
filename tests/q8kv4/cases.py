@@ -57,6 +57,10 @@ FULL_CASES = (
     DecodeCase("b4_s50000_topk32", (50_000,) * 4, q_len=4, topk=32, seed=18),
     DecodeCase("b2_s100000_topk64", (100_000,) * 2, q_len=2, topk=64, seed=19),
     DecodeCase("b4_s3000_topk1", (3_000,) * 4, q_len=4, topk=1, seed=20),
+    # Odd top-k: the planner must count the last 128-token page of a 256-token KV tile.
+    DecodeCase("b8_s20000_topk15", (20_000,) * 8, q_len=6, topk=15, seed=21),
+    # Non-power-of-two query chunks over several waves take the persistent scheduler.
+    DecodeCase("b32_s10000_q6", (10_000,) * 32, q_len=6, seed=22),
 )
 
 
