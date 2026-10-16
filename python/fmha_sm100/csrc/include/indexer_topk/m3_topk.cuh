@@ -153,17 +153,64 @@ __device__ __noinline__ void warp_peel_row(int nvm,
   __syncwarp();  // lane 0's writes visible to the rest of this warp
 }
 
+// Same ranking as block_topk_atomicmax (same keys, so the same 15 ids in the
+// same order) with 3 block barriers instead of 17: every warp peels its own
+// top kSelK with redux.sync, then warp 0 ranks the kScoreWarps * kSelK
+// survivors, which hold the row's top kSelK.
+template <int KPT>
+__device__ __forceinline__ void block_topk_two_stage(
+    int nvm, const float* __restrict__ rsc1, SelectSmem& s,
+    unsigned (&cand)[kScoreWarps][kSelK]) {
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5, lane = tid & 31;
+  constexpr int SH = KPT < kSelK ? KPT : kSelK;
+  unsigned key[KPT];
+  topk_sel::load_quantize_keys<KPT>(nvm, rsc1, s, key);
+  topk_sel::sort_desc_u32<KPT>(key);
+#pragma unroll
+  for (int r = 0; r < kSelK; ++r) {
+    unsigned M;
+    asm("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(M) : "r"(key[0]));
+    if (lane == 0) cand[warp][r] = M;
+    topk_sel::winner_shift_down<SH>(key, key[0] == M);
+  }
+  __syncthreads();
+  if (warp == 0) {
+    constexpr int kCand = kScoreWarps * kSelK;
+    constexpr int kPer = (kCand + 31) / 32;
+    unsigned c[kPer];
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      const int idx = lane + 32 * i;
+      c[i] = (idx < kCand) ? (&cand[0][0])[idx] : 0u;
+    }
+    topk_sel::sort_desc_u32<kPer>(c);
+#pragma unroll
+    for (int r = 0; r < kSelK; ++r) {
+      unsigned M;
+      asm("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(M) : "r"(c[0]));
+      if (lane == 0) s.sel_ids[r] = static_cast<int>((~M) & 0xFFFFu);
+      topk_sel::winner_shift_down<kPer < kSelK ? kPer : kSelK>(c, c[0] == M);
+    }
+  }
+  __syncthreads();
+}
+
 // One row, one CTA: take the narrowest rung that covers this row's nvm.
 template <int I>
 __device__ __forceinline__ void block_rank_row(int nvm,
                                                const float* __restrict__ p,
-                                               SelectSmem& s) {
+                                               SelectSmem& s, bool two_stage,
+                                               unsigned (&cand)[kScoreWarps][kSelK]) {
   constexpr int KPT = kRung[I];
   constexpr bool kLast = (I + 1 == kRungs);  // covers kMaxNvm by static_assert
   if (kLast || nvm <= KPT * kThreads) {
-    block_topk_atomicmax<KPT>(nvm, p, s);
+    if (two_stage)
+      block_topk_two_stage<KPT>(nvm, p, s, cand);
+    else
+      block_topk_atomicmax<KPT>(nvm, p, s);
   } else if constexpr (!kLast) {  // discarded at the last rung, so it terminates
-    block_rank_row<I + 1>(nvm, p, s);
+    block_rank_row<I + 1>(nvm, p, s, two_stage, cand);
   }
 }
 
@@ -202,7 +249,8 @@ inline int m3_rows_per_block(int n_max) {
 __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
     const float* __restrict__ scores, const int* __restrict__ row_n,
     int* __restrict__ out_ids, int n_max, int row_stride, int rows,
-    int rows_per_group, int64_t group_stride) {
+    int rows_per_group, int64_t group_stride, bool two_stage) {
+  __shared__ unsigned cand[kScoreWarps][kSelK];
   __shared__ union Smem {
     SelectSmem s;
     int sel[kRowsPerBlock][kSelK];
@@ -244,7 +292,7 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
       block_rank_row<0>(nvm,
                         row_scores(scores, row, row_stride, rows_per_group,
                                    group_stride),
-                        u.s);
+                        u.s, two_stage, cand);
       write_row(out_ids, row, tid, nvm, u.s.sel_ids);
     }
   }
@@ -276,11 +324,33 @@ inline int m3_occ() {
 // rows ~3072 the retiring CTAs stop fitting in the shadow of the working ones:
 // +7 to +15% at 4096 rows, +31 to +45% at 8192. A caller working at that scale
 // wants the packed grid back.
+// SM107 (Rubin) check for launch-shape choices that only that target takes.
+inline bool m3_is_sm107() {
+  static int cached[64] = {};  // 0 unknown, 1 no, 2 yes
+  int device = 0;
+  cudaGetDevice(&device);
+  if (device < 0 || device >= 64) return false;
+  if (cached[device] == 0) {
+    int major = 0, minor = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    cached[device] = (major == 10 && minor == 7) ? 2 : 1;
+  }
+  return cached[device] == 2;
+}
+
+// On SM107, warp-family launches past this many rows take the packed grid
+// (kRowsPerBlock rows per CTA): prefill launches 16K-64K rows, where the
+// retiring CTAs of the one-CTA-per-row grid no longer hide (see above).
+constexpr int kPackedGridMinRows = 2048;
+
 inline void m3_launch(const float* scores, const int* row_n, int* out, int n_max,
                       int row_stride, int rows, int rows_per_group,
                       int64_t group_stride, cudaStream_t st, bool pdl = true) {
   cudaLaunchConfig_t config{};
-  config.gridDim = dim3(rows);
+  const bool packed = m3_is_sm107() && (n_max - 1) <= kThreads &&
+                      rows > kPackedGridMinRows;
+  config.gridDim = dim3(packed ? (rows + kRowsPerBlock - 1) / kRowsPerBlock : rows);
   config.blockDim = dim3(kThreads);
   config.stream = st;
   cudaLaunchAttribute attribute{};
@@ -289,7 +359,7 @@ inline void m3_launch(const float* scores, const int* row_n, int* out, int n_max
   config.attrs = &attribute;
   config.numAttrs = 1;
   cudaLaunchKernelEx(&config, m3_topk_kernel, scores, row_n, out, n_max, row_stride,
-                     rows, rows_per_group, group_stride);
+                     rows, rows_per_group, group_stride, m3_is_sm107());
 }
 
 }  // namespace m3
