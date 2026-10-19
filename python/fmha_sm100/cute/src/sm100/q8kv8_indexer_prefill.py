@@ -13,6 +13,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cuda.bindings.driver as cuda
+from quack import copy_utils
 
 
 class NamedBarrierIndexerSm100(enum.IntEnum):
@@ -34,9 +35,14 @@ class Q8KV8PrefillIndexerSm100:
     q_tile = 256
     k_tile = 128
     q_stages = 1
-    k_stages = 12
-    acc_stages = 4
+    k_stages = 8
+    acc_stages = 2
+    ctas_per_sm = 2
     num_task_buckets = 8
+    # Pages per coalesced score store group, and the padded row pitch of the
+    # per-warp staging tile (odd, so row-major writes avoid bank conflicts).
+    score_group_pages = 8
+    score_buf_pitch = 9
     cta_group_size = 2
     # Task descriptor words: global Q row, Q position, first logical page,
     # batch index, and (q_rows - 1) | (page_count - 1) << task_page_count_shift.
@@ -96,14 +102,13 @@ class Q8KV8PrefillIndexerSm100:
             self.mma_inst_k(compute_capability, self.io_dtype),
         )
 
-        self.score_warp_ids = tuple(range(8))
-        self.q_load_warp_id = 8
-        self.k_load_warp_id = 9
-        self.mma_warp_id = 10
+        self.score_warp_ids = tuple(range(4))
+        self.q_load_warp_id = 4
+        self.k_load_warp_id = 5
+        self.mma_warp_id = 6
         self.score_threads = cute.arch.WARP_SIZE * len(self.score_warp_ids)
         self.score_consumer_warps = 4
-        self.score_worker_groups = 2
-        self.threads_per_cta = cute.arch.WARP_SIZE * 12
+        self.threads_per_cta = cute.arch.WARP_SIZE * 8
         # Register budgets per warp role. The launch allocates 168 registers
         # per thread (64K / 384 threads). On SM107 every role keeps that: the
         # score warps fit in 168, and growing them to 192 starved the loader
@@ -112,11 +117,11 @@ class Q8KV8PrefillIndexerSm100:
         # the score warps spin forever in setmaxregister_increase.
         if compute_capability == (10, 7):
             self.num_regs_score = 168
-            self.num_regs_other = 168
+            self.num_regs_other = 88
         else:
             self.num_regs_score = 192
             self.num_regs_other = 32
-        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        self.tmem_alloc_cols = self.acc_stages * self.k_tile
 
     @cute.jit
     def __call__(
@@ -206,6 +211,13 @@ class Q8KV8PrefillIndexerSm100:
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.acc_stages * 2]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buffer: cutlass.Int32
+            score_buf: cute.struct.MemRange[
+                cutlass.Float32,
+                cute.arch.WARP_SIZE * self.score_buf_pitch * len(self.score_warp_ids),
+            ]
+            score_row_limit: cute.struct.MemRange[
+                cutlass.Int32, cute.arch.WARP_SIZE * len(self.score_warp_ids)
+            ]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -231,7 +243,13 @@ class Q8KV8PrefillIndexerSm100:
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape_mnk,
             stream=stream,
-            min_blocks_per_mp=1,
+            # Dynamic SMEM: the storage struct plus the 128B-aligned Q and K
+            # stages; the launch sizes the carveout for ctas_per_sm from it.
+            smem=self.shared_storage.size_in_bytes()
+            + cute.size_in_bytes(self.io_dtype, q_smem_layout)
+            + cute.size_in_bytes(self.io_dtype, k_smem_layout)
+            + 2 * 128,
+            min_blocks_per_mp=self.ctas_per_sm,
         )
 
     @cute.jit
@@ -273,6 +291,44 @@ class Q8KV8PrefillIndexerSm100:
             q_rows,
             page_count,
         )
+
+    @cute.jit
+    def _flush_scores(
+        self,
+        sScoreBuf: cute.Tensor,
+        sRowLimit: cute.Tensor,
+        score_warp: cutlass.Int32,
+        q_row_base: cutlass.Int32,
+        group_page: cutlass.Int32,
+        group_len: cutlass.Int32,
+        mScores: cute.Tensor,
+    ):
+        """Write a warp's staged (32 rows x group) maxima, consecutive pages per lane group."""
+        cute.arch.sync_warp()
+        tile_shape = (cute.arch.WARP_SIZE, self.score_group_pages)
+        gScores = cute.local_tile(
+            cute.domain_offset((q_row_base, group_page), mScores), tile_shape, (0, 0)
+        )
+        sScores = sScoreBuf[(None, None, score_warp)]
+        cScores = cute.make_identity_tensor(tile_shape)
+        # 4 rows x 8 pages per store: lanes 8r..8r+7 write consecutive pages of row r.
+        tiled_copy = copy_utils.tiled_copy_2d(
+            cutlass.Float32, self.score_group_pages, cute.arch.WARP_SIZE
+        )
+        thr_copy = tiled_copy.get_slice(cute.arch.lane_idx())
+        tSsS = thr_copy.partition_S(sScores)
+        tSgS = thr_copy.partition_D(gScores)
+        tScS = thr_copy.partition_S(cScores)
+        for m in cutlass.range_constexpr(cute.size(tSgS, mode=[1])):
+            for n in cutlass.range_constexpr(cute.size(tSgS, mode=[2])):
+                row, col = tScS[(0, m, n)]
+                # Pages inside the group and below the row's staged causal limit
+                # (0 for rows past the task); branched, not predicated, so the warp
+                # skips stores with no live lane.
+                if col < group_len:
+                    if group_page + col < sRowLimit[(row, score_warp)]:
+                        tSgS[(None, m, n)].store(tSsS[(None, m, n)].load())
+        cute.arch.sync_warp()
 
     @cute.jit
     def _reduce_accumulator_row(self, tTR_rAcc: cute.Tensor) -> cutlass.Float32:
@@ -324,6 +380,23 @@ class Q8KV8PrefillIndexerSm100:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        sScoreBuf = storage.score_buf.get_tensor(
+            cute.make_layout(
+                (
+                    cute.arch.WARP_SIZE,
+                    self.score_group_pages,
+                    len(self.score_warp_ids),
+                ),
+                stride=(
+                    self.score_buf_pitch,
+                    1,
+                    cute.arch.WARP_SIZE * self.score_buf_pitch,
+                ),
+            )
+        )
+        sRowLimit = storage.score_row_limit.get_tensor(
+            cute.make_layout((cute.arch.WARP_SIZE, len(self.score_warp_ids)))
+        )
         sQ = smem.allocate_tensor(
             element_type=self.io_dtype,
             layout=q_smem_layout.outer,
@@ -426,17 +499,19 @@ class Q8KV8PrefillIndexerSm100:
 
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
         tmem.allocate(self.tmem_alloc_cols)
+        # Release the TMEM allocation permit right away so a second CTA can launch on this SM.
+        tmem.relinquish_alloc_permit()
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
         tmem_atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x128),
+            tcgen05.Ld32x32bOp(tcgen05.Repetition.x64),
             self.acc_dtype,
         )
         if cutlass.const_expr(self.use_tmem_load_reduce):
             tmem_load_reduce_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
-                    tcgen05.copy.Repetition.x128,
+                    tcgen05.copy.Repetition.x64,
                     redOp=tcgen05.TmemLoadRedOp.MAX,
                 ),
                 self.acc_dtype,
@@ -447,12 +522,9 @@ class Q8KV8PrefillIndexerSm100:
             tmem_atom,
             tCtAcc_staged[(None, None, None, 0)],
         )
+        # Score thread i reads accumulator row i of this CTA's 128-row half.
         score_tid = tidx % cutlass.Int32(self.score_threads)
-        tile_worker_idx = score_tid // cutlass.Int32(self.q_tile // 2)
-        tmem_tid = score_tid - tile_worker_idx * cutlass.Int32(
-            self.q_tile // 2
-        )
-        tmem_thr_copy = tmem_tiled_copy.get_slice(tmem_tid)
+        tmem_thr_copy = tmem_tiled_copy.get_slice(score_tid)
         tTR_tAcc_staged = tmem_thr_copy.partition_S(tCtAcc_staged)
         tCcC = thr_mma.partition_C(
             cute.make_identity_tensor(self.mma_tiler_mnk[:2])
@@ -460,20 +532,22 @@ class Q8KV8PrefillIndexerSm100:
         tTR_cC = tmem_thr_copy.partition_D(tCcC)
         tTR_rAcc = cute.make_rmem_tensor(tTR_cC.shape, self.acc_dtype)
         tTR_rBlockMax = cute.make_rmem_tensor(
-            cute.make_layout((1, 1), stride=(0, 1)),
+            cute.make_layout((1, 2), stride=(0, 1)),
             self.acc_dtype,
         )
 
         if warp_idx <= self.score_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_score)
             row_m = tTR_cC[0][0]
+            # 32x32b TMEM loads: lane i of a warp owns accumulator row base + i.
+            row_base = row_m - cute.arch.lane_idx()
+            score_warp = warp_idx
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
                 self.acc_stages,
             )
-            if tile_worker_idx == cutlass.Int32(1):
-                acc_consumer_state.advance()
-            tile_base = cutlass.Int32(0)
+            # Buckets in decreasing cost; cluster c takes every N-th task of each,
+            # and the start rotates by each bucket's count so leftovers spread out.
             worker_base = cutlass.Int32(0)
             for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
@@ -499,29 +573,18 @@ class Q8KV8PrefillIndexerSm100:
                     local_block = (
                         q_position_begin + row_m // num_heads
                     ) >> cutlass.Int32(7)
-                    local_start = tile_worker_idx ^ (
-                        tile_base & cutlass.Int32(1)
-                    )
-                    worker_tiles = (
-                        page_count
-                        + cutlass.Int32(1)
-                        - local_start
-                    ) // cutlass.Int32(self.score_worker_groups)
-                    for worker_tile_idx in cutlass.range(
-                        worker_tiles,
-                        unroll=1,
-                    ):
-                        tile_idx = (
-                            local_start
-                            + worker_tile_idx
-                            * cutlass.Int32(self.score_worker_groups)
-                        )
+                    row_limit = cutlass.Int32(0)
+                    if q_valid:
+                        row_limit = local_block
+                    cute.arch.sync_warp()
+                    sRowLimit[(cute.arch.lane_idx(), score_warp)] = row_limit
+                    for tile_idx in cutlass.range(page_count, unroll=1):
                         acc_pipe.consumer_wait(acc_consumer_state)
                         tTR_tAcc = tTR_tAcc_staged[
                             (None, None, None, None, acc_consumer_state.index)
                         ]
                         if cutlass.const_expr(self.use_tmem_load_reduce):
-                            for chunk in cutlass.range_constexpr(1):
+                            for chunk in cutlass.range_constexpr(2):
                                 cute.copy_atom_call(
                                     tmem_load_reduce_atom,
                                     tTR_tAcc[(None, chunk, 0, 0)],
@@ -535,16 +598,28 @@ class Q8KV8PrefillIndexerSm100:
                         cute.arch.fence_view_async_tmem_load()
                         with cute.arch.elect_one():
                             acc_pipe.consumer_release(acc_consumer_state)
-                        logical_page = page_begin + tile_idx
-                        if q_valid and logical_page < local_block:
-                            if cutlass.const_expr(self.use_tmem_load_reduce):
-                                block_max = tTR_rBlockMax[(0, 0)]
-                            else:
-                                block_max = self._reduce_accumulator_row(tTR_rAcc)
-                            mScores[q_global, logical_page] = block_max
+                        if cutlass.const_expr(self.use_tmem_load_reduce):
+                            block_max = cute.arch.fmax(
+                                tTR_rBlockMax[(0, 0)], tTR_rBlockMax[(0, 1)]
+                            )
+                        else:
+                            block_max = self._reduce_accumulator_row(tTR_rAcc)
+                        slot = tile_idx % cutlass.Int32(self.score_group_pages)
+                        sScoreBuf[(cute.arch.lane_idx(), slot, score_warp)] = block_max
+                        if (
+                            slot == cutlass.Int32(self.score_group_pages - 1)
+                            or tile_idx == page_count - cutlass.Int32(1)
+                        ):
+                            self._flush_scores(
+                                sScoreBuf,
+                                sRowLimit,
+                                score_warp,
+                                q_global_begin + row_base,
+                                page_begin + tile_idx - slot,
+                                slot + cutlass.Int32(1),
+                                mScores,
+                            )
                         acc_consumer_state.advance()
-                        acc_consumer_state.advance()
-                    tile_base += page_count
                     task_idx += cutlass.Int32(self.num_persistent_clusters)
                 worker_base = (
                     worker_base + task_count
@@ -555,6 +630,8 @@ class Q8KV8PrefillIndexerSm100:
                 pipeline.PipelineUserType.Producer,
                 self.q_stages,
             )
+            # Buckets in decreasing cost; cluster c takes every N-th task of each,
+            # and the start rotates by each bucket's count so leftovers spread out.
             worker_base = cutlass.Int32(0)
             for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
@@ -617,6 +694,8 @@ class Q8KV8PrefillIndexerSm100:
                 pipeline.PipelineUserType.Producer,
                 self.k_stages,
             )
+            # Buckets in decreasing cost; cluster c takes every N-th task of each,
+            # and the start rotates by each bucket's count so leftovers spread out.
             worker_base = cutlass.Int32(0)
             for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
@@ -699,17 +778,15 @@ class Q8KV8PrefillIndexerSm100:
             )
             num_k_blocks = cute.size(tCrQ, mode=[2])
             if is_leader_cta:
+                # Buckets in decreasing cost; cluster c takes every N-th task of each,
+                # and the start rotates by each bucket's count so leftovers spread out.
                 worker_base = cutlass.Int32(0)
                 for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
-                    bucket = cutlass.Int32(
-                        self.num_task_buckets - 1 - rev_bucket
-                    )
+                    bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
                     task_count = mTaskCounts[bucket]
                     task_idx = cluster_idx - worker_base
                     if task_idx < cutlass.Int32(0):
-                        task_idx += cutlass.Int32(
-                            self.num_persistent_clusters
-                        )
+                        task_idx += cutlass.Int32(self.num_persistent_clusters)
                     while task_idx < task_count:
                         (
                             _,
@@ -770,19 +847,18 @@ class Q8KV8PrefillIndexerSm100:
                             acc_producer_state.advance()
                         q_pipe.consumer_release(q_consumer_state)
                         q_consumer_state.advance()
-                        task_idx += cutlass.Int32(
-                            self.num_persistent_clusters
-                        )
+                        task_idx += cutlass.Int32(self.num_persistent_clusters)
                     worker_base = (
                         worker_base + task_count
                     ) % cutlass.Int32(self.num_persistent_clusters)
                 acc_pipe.producer_tail(acc_producer_state)
         else:
-            # Warp 11 completes the 12-warp warpgroup contract.
+            # Warp 7 completes the second 4-warp warpgroup.
             cute.arch.setmaxregister_decrease(self.num_regs_other)
 
-        tmem.relinquish_alloc_permit()
         pipeline.sync(barrier_id=int(NamedBarrierIndexerSm100.Final))
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
         tmem.free(tmem_ptr)
 
 
