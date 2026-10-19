@@ -65,6 +65,10 @@ static_assert(kRung[kRungs - 1] * kThreads >= kMaxNvm,
 // shape, not what any one row of that launch takes.
 inline int m3_warp_max(int n_max, int rows);
 
+// Keys each half-warp thread of the paired-row path keeps (wide_pair_kernel): more than
+// kSelK, so a thread cannot run dry within the rounds and no row needs redo_row.
+constexpr int kKeepPair = 16;
+
 inline const char* m3_family(int n, int rows = kWarpWideMinRows) {
   if (n <= kTopK) return "trivial";
   return m3_warp_max(n, rows) > 0 ? "warp" : "block";
@@ -410,6 +414,22 @@ __device__ __forceinline__ void top8_merge(unsigned (&a)[8], const unsigned (&b)
   for (int k = 4; k >= 1; k >>= 1)
 #pragma unroll
     for (int i = 0; i < 8; ++i)
+      if ((i & k) == 0) {
+        const unsigned x = a[i], y = a[i + k];
+        a[i] = x > y ? x : y;
+        a[i + k] = x > y ? y : x;
+      }
+}
+
+// Top N of two descending lists (N a power of two): bitonic half-cleaner.
+template <int N>
+__device__ __forceinline__ void topk_merge(unsigned (&a)[N], const unsigned (&b)[N]) {
+#pragma unroll
+  for (int i = 0; i < N; ++i) a[i] = a[i] > b[N - 1 - i] ? a[i] : b[N - 1 - i];
+#pragma unroll
+  for (int k = N / 2; k >= 1; k >>= 1)
+#pragma unroll
+    for (int i = 0; i < N; ++i)
       if ((i & k) == 0) {
         const unsigned x = a[i], y = a[i + k];
         a[i] = x > y ? x : y;
@@ -953,11 +973,11 @@ __device__ __noinline__ int rounds_half(unsigned head, const unsigned* __restric
     head = w ? nx : head;
     if (r + 1 < kSelK) {
       po += w ? kThreads : 0;
-      po = po < 7 * kThreads ? po : 7 * kThreads;
+      po = po < (kKeepPair - 1) * kThreads ? po : (kKeepPair - 1) * kThreads;
       nx = lst[po];
     }
   }
-  const unsigned dry = __ballot_sync(0xFFFFFFFFu, can_run_dry && pops >= 8);
+  const unsigned dry = __ballot_sync(0xFFFFFFFFu, can_run_dry && pops >= kKeepPair);
   const int redo = ((dry & 0xFFFFu) ? 1 : 0) | ((dry >> 16) ? 2 : 0);
   if (!(redo & (hi ? 2 : 1))) {
     if (hl < kSelK) o[hl] = static_cast<int>((~mine) & 0xFFFFu);
@@ -1001,47 +1021,22 @@ __device__ __noinline__ int rank_half(const float* __restrict__ rs, int nvm, int
 #pragma unroll
   for (int t = 0; t < TS; ++t)
     u[4 * F + t] = narrow::narrow_key(v[4 * F + t], scale, bias, low1 - static_cast<unsigned>(64 * F + 16 * t));
-  unsigned t8[8];
-  constexpr int R = E % 8, C = E - R;
-  if constexpr (C == 0) {
-    unsigned w8[E];
+  unsigned t8[kKeepPair];
 #pragma unroll
-    for (int e = 0; e < E; ++e) w8[e] = u[e];
-    topk_sel::sort_desc_u32<E>(w8);
+  for (int i = 0; i < kKeepPair; ++i) t8[i] = i < E ? u[i] : 0u;
+  topk_sel::sort_desc_u32<kKeepPair>(t8);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) t8[i] = i < E ? w8[i] : 0u;
-  } else {
+  for (int c = kKeepPair; c < E; c += kKeepPair) {
+    unsigned b[kKeepPair];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) t8[i] = u[i];
-    topk_sel::sort_desc_u32<8>(t8);
-#pragma unroll
-    for (int c = 8; c < C; c += 8) {
-      unsigned b8[8];
-#pragma unroll
-      for (int i = 0; i < 8; ++i) b8[i] = u[c + i];
-      topk_sel::sort_desc_u32<8>(b8);
-      narrow::top8_merge(t8, b8);
-    }
-    if constexpr (R == 1) {
-      unsigned x = u[C];
-#pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const unsigned h = t8[i] > x ? t8[i] : x;
-        x = t8[i] > x ? x : t8[i];
-        t8[i] = h;
-      }
-    } else if constexpr (R > 1) {
-      unsigned b8[8];
-#pragma unroll
-      for (int i = 0; i < 8; ++i) b8[i] = i < R ? u[C + i] : 0u;
-      topk_sel::sort_desc_u32<8>(b8);
-      narrow::top8_merge(t8, b8);
-    }
+    for (int i = 0; i < kKeepPair; ++i) b[i] = c + i < E ? u[c + i] : 0u;
+    topk_sel::sort_desc_u32<kKeepPair>(b);
+    narrow::topk_merge<kKeepPair>(t8, b);
   }
 #pragma unroll
-  for (int i = 1; i < 8; ++i) lst[(i - 1) * kThreads] = t8[i];
-  lst[7 * kThreads] = 0u;
-  return rounds_half(t8[0], lst, lane, o, nvm, E > 8);
+  for (int i = 1; i < kKeepPair; ++i) lst[(i - 1) * kThreads] = t8[i];
+  lst[(kKeepPair - 1) * kThreads] = 0u;
+  return rounds_half(t8[0], lst, lane, o, nvm, E > kKeepPair);
 }
 template <int TS, int F>
 __device__ __forceinline__ int half_dispatch(int f, const float* rs, int nvm, int lane, int* o, unsigned* lst,
@@ -1078,7 +1073,7 @@ template <int kWarpMax>
 __global__ __launch_bounds__(kThreads, kMinBlocks) void wide_pair_kernel(
     const float* __restrict__ scores, const int* __restrict__ row_n, int* __restrict__ out_ids,
     RowLayout layout, int rows, int n_cols) {
-  __shared__ unsigned lst[8 * kThreads];
+  __shared__ unsigned lst[(kKeepPair > 8 ? kKeepPair : 8) * kThreads];
   wait_for_scores();
   const int tid = static_cast<int>(threadIdx.x), lane = tid & 31;
   const int r0 = (static_cast<int>(blockIdx.x) * kRows + (tid >> 5)) * 2, r1 = r0 + 1;
