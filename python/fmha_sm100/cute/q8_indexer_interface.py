@@ -67,6 +67,17 @@ _PREFILL_TASK_CAPACITY_PAGE_CHUNK = 4
 # round-robin, so several smaller tasks per cluster even out the causal page
 # counts across SMs.
 _PREFILL_TASKS_PER_CLUSTER = 4
+# Locality-domain steering: the SM -> memory locality domain table the score kernel steers by
+# (set_prefill_sm_domains). Off by default (one merged largest-first queue);
+# Q8KV8_LOCALITY_STEER=1 makes each cluster claim its own domain's half-tasks first.
+_PREFILL_SM_DOMAINS: "torch.Tensor | None" = None
+_PREFILL_LOCALITY_STEER = __import__("os").environ.get("Q8KV8_LOCALITY_STEER", "0") != "0"
+
+
+def set_prefill_sm_domains(table) -> None:
+    """Set the SM -> locality domain table (int32, indexed by %smid) for later plans."""
+    global _PREFILL_SM_DOMAINS
+    _PREFILL_SM_DOMAINS = table
 _SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
 # Kernels plus this interface, which fixes the compiled argument alignments.
 _CODEGEN_SOURCES = (
@@ -637,6 +648,8 @@ class _PrefillPlanState:
     block_table: torch.Tensor
     task_descriptors: torch.Tensor
     task_counts: torch.Tensor
+    task_queue: torch.Tensor
+    sm_domains: torch.Tensor
     plan_error: torch.Tensor
     task_capacity: int
     num_candidate_q_tiles: int
@@ -809,6 +822,18 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             task_counts=torch.empty(
                 (Q8KV8PrefillIndexerPlanBuild.num_buckets,), dtype=torch.int32, **options
             ),
+            # Per-domain claim counters and the drained-cluster count; the score
+            # kernel leaves them zeroed, so they are initialized once here.
+            task_queue=torch.zeros(
+                (Q8KV8PrefillIndexerSm100.num_domains + 2,), dtype=torch.int32, **options
+            ),
+            sm_domains=(
+                _PREFILL_SM_DOMAINS.to(device=device, dtype=torch.int32).contiguous()
+                if _PREFILL_SM_DOMAINS is not None
+                else torch.zeros(
+                    (max(_sm_count(device), 256),), dtype=torch.int32, **options
+                )
+            ),
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
             num_candidate_q_tiles=batch * -(-max_seqlen_q * self._num_heads // q_tile),
@@ -869,6 +894,8 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             state.scores,
             state.task_descriptors,
             state.task_counts,
+            state.task_queue,
+            state.sm_domains,
         )
         compiled = _compile_or_load(
             _cute_kernel_key(
@@ -878,11 +905,13 @@ class BatchPrefillIndexerQ8KV8Wrapper:
                 Q8KV8PrefillIndexerSm100.q_tile,
                 Q8KV8PrefillIndexerSm100.k_stages,
                 Q8KV8PrefillIndexerSm100.acc_stages,
+                _PREFILL_LOCALITY_STEER,
             ),
             lambda: cute.compile(
                 Q8KV8PrefillIndexerSm100(
                     compute_capability=capability,
                     num_persistent_clusters=num_persistent_clusters,
+                    locality_steer=_PREFILL_LOCALITY_STEER,
                 ),
                 *_cute_arguments((q_rows, k_cache), metadata),
                 Int32(state.num_heads),

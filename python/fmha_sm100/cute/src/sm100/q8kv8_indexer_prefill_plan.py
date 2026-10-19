@@ -13,7 +13,9 @@ from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
 class Q8KV8PrefillIndexerPlanReset:
     """Reset device-resident queue counters and error state."""
 
-    num_buckets = Q8KV8PrefillIndexerSm100.num_task_buckets
+    num_buckets = (
+        Q8KV8PrefillIndexerSm100.num_task_buckets * Q8KV8PrefillIndexerSm100.num_domains
+    )
     threads_per_cta = cute.arch.WARP_SIZE
 
     @cute.jit
@@ -54,10 +56,15 @@ class Q8KV8PrefillIndexerPlanBuild:
 
     q_tile = Q8KV8PrefillIndexerSm100.q_tile
     page_size = Q8KV8PrefillIndexerSm100.k_tile
-    num_buckets = Q8KV8PrefillIndexerSm100.num_task_buckets
+    num_buckets = (
+        Q8KV8PrefillIndexerSm100.num_task_buckets * Q8KV8PrefillIndexerSm100.num_domains
+    )
+    cost_buckets = Q8KV8PrefillIndexerSm100.num_task_buckets
+    num_domains = Q8KV8PrefillIndexerSm100.num_domains
+    domain_group_pages = Q8KV8PrefillIndexerSm100.domain_group_pages
     split_page_chunk = 64
     large_page_chunk = 128
-    min_page_chunk = 8
+    min_page_chunk = 16
     split_q_tile_threshold = 60
     descriptor_words = Q8KV8PrefillIndexerSm100.task_descriptor_words
     page_count_shift = Q8KV8PrefillIndexerSm100.task_page_count_shift
@@ -204,6 +211,10 @@ class Q8KV8PrefillIndexerPlanBuild:
             # count when few Q tiles would otherwise leave most clusters idle.
             if page_chunk > max_page_chunk:
                 page_chunk = max_page_chunk
+            # Chunks start at multiples of one 8-page group per domain, so every
+            # half-task covers whole groups of its domain.
+            stripe = cutlass.Int32(self.domain_group_pages * self.num_domains)
+            page_chunk = (page_chunk + stripe - cutlass.Int32(1)) // stripe * stripe
             if page_chunk > num_pages:
                 page_chunk = num_pages
             page_begin = cutlass.Int32(0)
@@ -211,31 +222,45 @@ class Q8KV8PrefillIndexerPlanBuild:
                 page_count = num_pages - page_begin
                 if page_count > page_chunk:
                     page_count = page_chunk
-                bucket = self._cost_bucket(q_rows, page_count)
-                slot = cute.arch.atomic_add(
-                    (mTaskCounts.iterator + bucket).llvm_ptr,
-                    cutlass.Int32(1),
-                    sem="relaxed",
-                    scope="gpu",
-                )
-                if slot < task_capacity:
-                    mTaskDescriptors[bucket, slot, 0] = q_start + q_local_begin
-                    mTaskDescriptors[bucket, slot, 1] = (
-                        seq_k - seq_q + q_local_begin // num_heads
-                    )
-                    mTaskDescriptors[bucket, slot, 2] = page_begin
-                    mTaskDescriptors[bucket, slot, 3] = batch_idx
-                    mTaskDescriptors[bucket, slot, 4] = self._pack_extent(
-                        q_rows,
-                        page_count,
-                    )
-                else:
-                    cute.arch.atomic_exch(
-                        mPlanError.iterator.llvm_ptr,
-                        cutlass.Int32(1),
-                        sem="relaxed",
-                        scope="gpu",
-                    )
+                # One half-task per domain: the chunk's 8-page groups of that domain.
+                group = cutlass.Int32(self.domain_group_pages)
+                stripes = page_count // stripe
+                tail = page_count - stripes * stripe
+                for domain in cutlass.range_constexpr(self.num_domains):
+                    in_tail = tail - cutlass.Int32(domain * self.domain_group_pages)
+                    if in_tail < cutlass.Int32(0):
+                        in_tail = cutlass.Int32(0)
+                    if in_tail > group:
+                        in_tail = group
+                    domain_pages = stripes * group + in_tail
+                    if domain_pages > cutlass.Int32(0):
+                        bucket = cutlass.Int32(
+                            domain * self.cost_buckets
+                        ) + self._cost_bucket(q_rows, domain_pages)
+                        slot = cute.arch.atomic_add(
+                            (mTaskCounts.iterator + bucket).llvm_ptr,
+                            cutlass.Int32(1),
+                            sem="relaxed",
+                            scope="gpu",
+                        )
+                        if slot < task_capacity:
+                            mTaskDescriptors[bucket, slot, 0] = q_start + q_local_begin
+                            mTaskDescriptors[bucket, slot, 1] = (
+                                seq_k - seq_q + q_local_begin // num_heads
+                            )
+                            mTaskDescriptors[bucket, slot, 2] = page_begin
+                            mTaskDescriptors[bucket, slot, 3] = batch_idx
+                            mTaskDescriptors[bucket, slot, 4] = self._pack_extent(
+                                q_rows,
+                                domain_pages,
+                            )
+                        else:
+                            cute.arch.atomic_exch(
+                                mPlanError.iterator.llvm_ptr,
+                                cutlass.Int32(1),
+                                sem="relaxed",
+                                scope="gpu",
+                            )
                 page_begin += page_count
 
 

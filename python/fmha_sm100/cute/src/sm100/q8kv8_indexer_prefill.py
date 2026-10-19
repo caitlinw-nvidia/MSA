@@ -13,7 +13,20 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cuda.bindings.driver as cuda
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 from quack import copy_utils
+
+
+@dsl_user_op
+def _smid(*, loc=None, ip=None) -> cutlass.Int32:
+    """Id of the SM running this thread (PTX ``%smid``)."""
+    out = llvm.inline_asm(
+        T.i32(), [], "mov.u32 $0, %smid;", "=r",
+        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )
+    return cutlass.Int32(out)
 
 
 class NamedBarrierIndexerSm100(enum.IntEnum):
@@ -48,6 +61,19 @@ class Q8KV8PrefillIndexerSm100:
     # batch index, and (q_rows - 1) | (page_count - 1) << task_page_count_shift.
     task_descriptor_words = 5
     task_page_count_shift = 8
+    # Memory locality domains: logical page L of every request lives in domain
+    # (L // domain_group_pages) % num_domains, and every task covers the pages
+    # of one domain inside a chunk that starts at a multiple of
+    # domain_group_pages * num_domains. Queue buckets are domain * 8 + cost bucket.
+    num_domains = 2
+    domain_group_pages = 8
+    # Task broadcast ring (leader K loader -> both CTAs). Consumers per task: per
+    # CTA 4 score warps and the Q loader, plus the leader's MMA warp and the
+    # peer's K loader.
+    task_ring_stages = 4
+    task_ring_consumers = 12
+    # Task code: index | queue bucket << task_code_bucket_shift; -1 ends a loop.
+    task_code_bucket_shift = 26
     # Operand formats with a dedicated SM107 MMA instruction (K=64 per
     # instruction). Any other format, and every other architecture, goes
     # through the generic F8F6F4 instruction at K=32.
@@ -74,6 +100,7 @@ class Q8KV8PrefillIndexerSm100:
         *,
         compute_capability: tuple[int, int],
         num_persistent_clusters: int,
+        locality_steer: bool = True,
     ) -> None:
         if compute_capability not in self.supported_compute_capabilities:
             raise ValueError(
@@ -90,6 +117,9 @@ class Q8KV8PrefillIndexerSm100:
         # its Q operand from the current consumer stage.
         self.q_stages = 2 if compute_capability == (10, 7) else 1
         self.num_persistent_clusters = num_persistent_clusters
+        # True: each cluster claims its own domain's half-tasks first (per-domain
+        # queues). False: one merged largest-first queue over both domains.
+        self.locality_steer = locality_steer
         self.use_tmem_load_reduce = compute_capability in ((10, 3), (10, 7))
         self.cluster_shape_mnk = (2, 1, 1)
         self.mma_tiler_mnk = (self.q_tile, self.k_tile, self.head_dim)
@@ -132,6 +162,8 @@ class Q8KV8PrefillIndexerSm100:
         mScores: cute.Tensor,
         mTaskDescriptors: cute.Tensor,
         mTaskCounts: cute.Tensor,
+        mTaskQueue: cute.Tensor,
+        mSmDomains: cute.Tensor,
         num_heads: cutlass.Int32,
         stream: cuda.CUstream = None,
     ):
@@ -218,6 +250,9 @@ class Q8KV8PrefillIndexerSm100:
             score_row_limit: cute.struct.MemRange[
                 cutlass.Int32, cute.arch.WARP_SIZE * len(self.score_warp_ids)
             ]
+            task_full_mbar: cute.struct.MemRange[cutlass.Int64, self.task_ring_stages]
+            task_empty_mbar: cute.struct.MemRange[cutlass.Int64, self.task_ring_stages]
+            task_ring: cute.struct.MemRange[cutlass.Int32, self.task_ring_stages]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -233,6 +268,8 @@ class Q8KV8PrefillIndexerSm100:
             mScores,
             mTaskDescriptors,
             mTaskCounts,
+            mTaskQueue,
+            mSmDomains,
             num_heads,
         ).launch(
             grid=(
@@ -291,6 +328,160 @@ class Q8KV8PrefillIndexerSm100:
             q_rows,
             page_count,
         )
+
+    def _decode_task(self, code: cutlass.Int32):
+        """Task code -> (queue bucket, index within the bucket, locality domain)."""
+        bucket = code >> cutlass.Int32(self.task_code_bucket_shift)
+        task_idx = code & cutlass.Int32((1 << self.task_code_bucket_shift) - 1)
+        return bucket, task_idx, bucket // cutlass.Int32(self.num_task_buckets)
+
+    def _logical_page(
+        self, page_begin: cutlass.Int32, k: cutlass.Int32, task_domain: cutlass.Int32
+    ) -> cutlass.Int32:
+        """Logical page of a half-task's k-th page: its domain's 8-page groups of the chunk."""
+        group = cutlass.Int32(self.domain_group_pages)
+        return (
+            page_begin
+            + (k // group) * cutlass.Int32(self.domain_group_pages * self.num_domains)
+            + task_domain * group
+            + k % group
+        )
+
+    def _queue_bucket(self, rank: int, domain):
+        """Queue bucket at claim rank ``rank``: largest cost first, per domain or merged."""
+        if self.locality_steer:
+            return domain * cutlass.Int32(self.num_task_buckets) + cutlass.Int32(
+                self.num_task_buckets - 1 - rank
+            )
+        return cutlass.Int32(
+            (rank % self.num_domains) * self.num_task_buckets
+            + self.num_task_buckets - 1 - rank // self.num_domains
+        )
+
+    @cute.jit
+    def _claim_code(
+        self,
+        mTaskQueue: cute.Tensor,
+        mTaskCounts: cute.Tensor,
+        domain: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """Pop one position from ``domain``'s counter and map it to a task code (-1: drained)."""
+        pos = cute.arch.atomic_add(
+            (mTaskQueue.iterator + domain).llvm_ptr,
+            cutlass.Int32(1),
+            sem="relaxed",
+            scope="gpu",
+        )
+        found = cutlass.Int32(0)
+        code = cutlass.Int32(-1)
+        start = cutlass.Int32(0)
+        ranks = self.num_task_buckets * (1 if self.locality_steer else self.num_domains)
+        for rank in cutlass.range_constexpr(ranks):
+            bucket = self._queue_bucket(rank, domain)
+            end = start + mTaskCounts[bucket]
+            if found == cutlass.Int32(0):
+                if pos < end:
+                    found = cutlass.Int32(1)
+                    code = (pos - start) | (
+                        bucket << cutlass.Int32(self.task_code_bucket_shift)
+                    )
+            start = end
+        return code
+
+    @cute.jit
+    def _cluster_domain(self, mSmDomains: cute.Tensor) -> cutlass.Int32:
+        """Locality domain of this CTA's SM (0 or 1; unknown SMs count as domain 0)."""
+        domain = cutlass.Int32(0)
+        if cute.arch.lane_idx() == cutlass.Int32(0):
+            domain = mSmDomains[_smid()]
+            if domain < cutlass.Int32(0):
+                domain = cutlass.Int32(0)
+            domain = domain & cutlass.Int32(self.num_domains - 1)
+        return cute.arch.shuffle_sync(domain, 0)
+
+    @cute.jit
+    def _task_push(
+        self,
+        sTask: cute.Tensor,
+        task_full_mbar: cute.Pointer,
+        task_empty_mbar: cute.Pointer,
+        task_seq: cutlass.Int32,
+        mTaskQueue: cute.Tensor,
+        mTaskCounts: cute.Tensor,
+        domain: cutlass.Int32,
+        stealing: cutlass.Int32,
+    ):
+        """Leader K loader: claim the next task code and broadcast it to both CTAs.
+
+        Claims from the cluster's own domain until it drains, then switches to the
+        other domain once (steer only); returns (code, domain, stealing).
+        """
+        slot = task_seq % cutlass.Int32(self.task_ring_stages)
+        phase = (task_seq // cutlass.Int32(self.task_ring_stages)) & cutlass.Int32(1)
+        cute.arch.mbarrier_wait(task_empty_mbar + slot, phase ^ cutlass.Int32(1))
+        code = cutlass.Int32(-1)
+        if cute.arch.lane_idx() == cutlass.Int32(0):
+            code = self._claim_code(mTaskQueue, mTaskCounts, domain)
+            if cutlass.const_expr(self.locality_steer):
+                if code < cutlass.Int32(0):
+                    if stealing == cutlass.Int32(0):
+                        domain = domain ^ cutlass.Int32(1)
+                        stealing = cutlass.Int32(1)
+                        code = self._claim_code(mTaskQueue, mTaskCounts, domain)
+            sTask[slot] = code
+            cute.arch.mbarrier_arrive(task_full_mbar + slot)
+            # The peer's slot completes on the async store's transaction bytes.
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                task_full_mbar + slot, 4, peer_cta_rank_in_cluster=1
+            )
+            cute.arch.store_async_dsmem(
+                sTask.iterator + slot, code, task_full_mbar + slot, 1
+            )
+        return (
+            cute.arch.shuffle_sync(code, 0),
+            cute.arch.shuffle_sync(domain, 0),
+            cute.arch.shuffle_sync(stealing, 0),
+        )
+
+    @cute.jit
+    def _task_pop(
+        self,
+        sTask: cute.Tensor,
+        task_full_mbar: cute.Pointer,
+        task_empty_mbar: cute.Pointer,
+        task_seq: cutlass.Int32,
+        is_leader_cta,
+    ) -> cutlass.Int32:
+        """Read the broadcast task code and free the leader's ring slot."""
+        slot = task_seq % cutlass.Int32(self.task_ring_stages)
+        phase = (task_seq // cutlass.Int32(self.task_ring_stages)) & cutlass.Int32(1)
+        cute.arch.mbarrier_wait(task_full_mbar + slot, phase)
+        code = cutlass.Int32(0)
+        if cute.arch.lane_idx() == cutlass.Int32(0):
+            code = sTask[slot]
+        code = cute.arch.shuffle_sync(code, 0)
+        if cute.arch.lane_idx() == cutlass.Int32(0):
+            if is_leader_cta:
+                cute.arch.mbarrier_arrive(task_empty_mbar + slot)
+            else:
+                cute.arch.mbarrier_arrive(
+                    task_empty_mbar + slot, peer_cta_rank_in_cluster=0
+                )
+        return code
+
+    @cute.jit
+    def _task_queue_exit(self, mTaskQueue: cute.Tensor):
+        """The last cluster to finish claiming resets the counters for the next launch."""
+        if cute.arch.lane_idx() == cutlass.Int32(0):
+            done = cute.arch.atomic_add(
+                (mTaskQueue.iterator + self.num_domains).llvm_ptr,
+                cutlass.Int32(1),
+                sem="relaxed",
+                scope="gpu",
+            )
+            if done == cutlass.Int32(self.num_persistent_clusters - 1):
+                for word in cutlass.range_constexpr(self.num_domains + 1):
+                    mTaskQueue[word] = cutlass.Int32(0)
 
     @cute.jit
     def _flush_scores(
@@ -362,6 +553,8 @@ class Q8KV8PrefillIndexerSm100:
         mScores: cute.Tensor,
         mTaskDescriptors: cute.Tensor,
         mTaskCounts: cute.Tensor,
+        mTaskQueue: cute.Tensor,
+        mSmDomains: cute.Tensor,
         num_heads: cutlass.Int32,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
@@ -397,6 +590,17 @@ class Q8KV8PrefillIndexerSm100:
         sRowLimit = storage.score_row_limit.get_tensor(
             cute.make_layout((cute.arch.WARP_SIZE, len(self.score_warp_ids)))
         )
+        sTask = storage.task_ring.get_tensor(cute.make_layout(self.task_ring_stages))
+        task_full_mbar = storage.task_full_mbar.data_ptr()
+        task_empty_mbar = storage.task_empty_mbar.data_ptr()
+        if warp_idx == self.q_load_warp_id:
+            with cute.arch.elect_one():
+                for slot in cutlass.range_constexpr(self.task_ring_stages):
+                    cute.arch.mbarrier_init(task_full_mbar + slot, 1)
+                    cute.arch.mbarrier_init(
+                        task_empty_mbar + slot, self.task_ring_consumers
+                    )
+            cute.arch.mbarrier_init_fence()
         sQ = smem.allocate_tensor(
             element_type=self.io_dtype,
             layout=q_smem_layout.outer,
@@ -546,147 +750,142 @@ class Q8KV8PrefillIndexerSm100:
                 pipeline.PipelineUserType.Consumer,
                 self.acc_stages,
             )
-            # Buckets in decreasing cost; cluster c takes every N-th task of each,
-            # and the start rotates by each bucket's count so leftovers spread out.
-            worker_base = cutlass.Int32(0)
-            for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
-                bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                task_count = mTaskCounts[bucket]
-                task_idx = cluster_idx - worker_base
-                if task_idx < cutlass.Int32(0):
-                    task_idx += cutlass.Int32(self.num_persistent_clusters)
-                while task_idx < task_count:
-                    (
-                        _,
-                        q_global_begin,
-                        q_position_begin,
-                        page_begin,
-                        q_rows,
-                        page_count,
-                    ) = self._get_task_descriptor(
-                        bucket,
-                        task_idx,
-                        mTaskDescriptors,
-                    )
-                    q_global = q_global_begin + row_m
-                    q_valid = row_m < q_rows
-                    local_block = (
-                        q_position_begin + row_m // num_heads
-                    ) >> cutlass.Int32(7)
-                    row_limit = cutlass.Int32(0)
-                    if q_valid:
-                        row_limit = local_block
-                    cute.arch.sync_warp()
-                    sRowLimit[(cute.arch.lane_idx(), score_warp)] = row_limit
-                    for tile_idx in cutlass.range(page_count, unroll=1):
-                        acc_pipe.consumer_wait(acc_consumer_state)
-                        tTR_tAcc = tTR_tAcc_staged[
-                            (None, None, None, None, acc_consumer_state.index)
-                        ]
-                        if cutlass.const_expr(self.use_tmem_load_reduce):
-                            for chunk in cutlass.range_constexpr(2):
-                                cute.copy_atom_call(
-                                    tmem_load_reduce_atom,
-                                    tTR_tAcc[(None, chunk, 0, 0)],
-                                    (
-                                        tTR_rAcc[(None, chunk, 0, 0)],
-                                        tTR_rBlockMax[(None, chunk)],
-                                    ),
-                                )
-                        else:
-                            cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
-                        cute.arch.fence_view_async_tmem_load()
-                        with cute.arch.elect_one():
-                            acc_pipe.consumer_release(acc_consumer_state)
-                        if cutlass.const_expr(self.use_tmem_load_reduce):
-                            block_max = cute.arch.fmax(
-                                tTR_rBlockMax[(0, 0)], tTR_rBlockMax[(0, 1)]
+            task_seq = cutlass.Int32(0)
+            code = self._task_pop(
+                sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+            )
+            task_seq += cutlass.Int32(1)
+            while code >= cutlass.Int32(0):
+                bucket, task_idx, task_domain = self._decode_task(code)
+                (
+                    _,
+                    q_global_begin,
+                    q_position_begin,
+                    page_begin,
+                    q_rows,
+                    page_count,
+                ) = self._get_task_descriptor(
+                    bucket,
+                    task_idx,
+                    mTaskDescriptors,
+                )
+                q_valid = row_m < q_rows
+                local_block = (
+                    q_position_begin + row_m // num_heads
+                ) >> cutlass.Int32(7)
+                row_limit = cutlass.Int32(0)
+                if q_valid:
+                    row_limit = local_block
+                cute.arch.sync_warp()
+                sRowLimit[(cute.arch.lane_idx(), score_warp)] = row_limit
+                for tile_idx in cutlass.range(page_count, unroll=1):
+                    acc_pipe.consumer_wait(acc_consumer_state)
+                    tTR_tAcc = tTR_tAcc_staged[
+                        (None, None, None, None, acc_consumer_state.index)
+                    ]
+                    if cutlass.const_expr(self.use_tmem_load_reduce):
+                        for chunk in cutlass.range_constexpr(2):
+                            cute.copy_atom_call(
+                                tmem_load_reduce_atom,
+                                tTR_tAcc[(None, chunk, 0, 0)],
+                                (
+                                    tTR_rAcc[(None, chunk, 0, 0)],
+                                    tTR_rBlockMax[(None, chunk)],
+                                ),
                             )
-                        else:
-                            block_max = self._reduce_accumulator_row(tTR_rAcc)
-                        slot = tile_idx % cutlass.Int32(self.score_group_pages)
-                        sScoreBuf[(cute.arch.lane_idx(), slot, score_warp)] = block_max
-                        if (
-                            slot == cutlass.Int32(self.score_group_pages - 1)
-                            or tile_idx == page_count - cutlass.Int32(1)
-                        ):
-                            self._flush_scores(
-                                sScoreBuf,
-                                sRowLimit,
-                                score_warp,
-                                q_global_begin + row_base,
-                                page_begin + tile_idx - slot,
-                                slot + cutlass.Int32(1),
-                                mScores,
-                            )
-                        acc_consumer_state.advance()
-                    task_idx += cutlass.Int32(self.num_persistent_clusters)
-                worker_base = (
-                    worker_base + task_count
-                ) % cutlass.Int32(self.num_persistent_clusters)
+                    else:
+                        cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
+                    with cute.arch.elect_one():
+                        acc_pipe.consumer_release(acc_consumer_state)
+                    if cutlass.const_expr(self.use_tmem_load_reduce):
+                        block_max = cute.arch.fmax(
+                            tTR_rBlockMax[(0, 0)], tTR_rBlockMax[(0, 1)]
+                        )
+                    else:
+                        block_max = self._reduce_accumulator_row(tTR_rAcc)
+                    slot = tile_idx % cutlass.Int32(self.score_group_pages)
+                    sScoreBuf[(cute.arch.lane_idx(), slot, score_warp)] = block_max
+                    if (
+                        slot == cutlass.Int32(self.score_group_pages - 1)
+                        or tile_idx == page_count - cutlass.Int32(1)
+                    ):
+                        # A flush group is 8 consecutive k of one domain: 8 consecutive
+                        # logical pages (the chunk starts at a multiple of 16).
+                        self._flush_scores(
+                            sScoreBuf,
+                            sRowLimit,
+                            score_warp,
+                            q_global_begin + row_base,
+                            self._logical_page(page_begin, tile_idx - slot, task_domain),
+                            slot + cutlass.Int32(1),
+                            mScores,
+                        )
+                    acc_consumer_state.advance()
+                code = self._task_pop(
+                    sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+                )
+                task_seq += cutlass.Int32(1)
         elif warp_idx == self.q_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             q_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.q_stages,
             )
-            # Buckets in decreasing cost; cluster c takes every N-th task of each,
-            # and the start rotates by each bucket's count so leftovers spread out.
-            worker_base = cutlass.Int32(0)
-            for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
-                bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                task_count = mTaskCounts[bucket]
-                task_idx = cluster_idx - worker_base
-                if task_idx < cutlass.Int32(0):
-                    task_idx += cutlass.Int32(self.num_persistent_clusters)
-                while task_idx < task_count:
-                    (
-                        _,
-                        q_global_begin,
-                        _,
-                        _,
-                        _,
-                        page_count,
-                    ) = self._get_task_descriptor(
-                        bucket,
-                        task_idx,
-                        mTaskDescriptors,
+            task_seq = cutlass.Int32(0)
+            code = self._task_pop(
+                sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+            )
+            task_seq += cutlass.Int32(1)
+            while code >= cutlass.Int32(0):
+                bucket, task_idx, _ = self._decode_task(code)
+                (
+                    _,
+                    q_global_begin,
+                    _,
+                    _,
+                    _,
+                    page_count,
+                ) = self._get_task_descriptor(
+                    bucket,
+                    task_idx,
+                    mTaskDescriptors,
+                )
+                if page_count > cutlass.Int32(0):
+                    mQ_task = cute.domain_offset(
+                        (q_global_begin, 0),
+                        q_tma_tensor,
                     )
-                    if page_count > cutlass.Int32(0):
-                        mQ_task = cute.domain_offset(
-                            (q_global_begin, 0),
-                            q_tma_tensor,
-                        )
-                        gQ = cute.local_tile(
-                            mQ_task,
-                            cute.slice_(self.mma_tiler_mnk, (None, 0, None)),
-                            (None, None),
-                        )
-                        tCgQ = thr_mma.partition_A(gQ)
-                        tQsQ, tQgQ = cpasync.tma_partition(
-                            q_tma_atom,
-                            cta_coord_vmnk[2],
-                            cute.make_layout(
-                                cute.size(cta_layout_vmnk, mode=[2])
-                            ),
-                            cute.group_modes(sQ, 0, 3),
-                            cute.group_modes(tCgQ, 0, 3),
-                        )
-                        q_pipe.producer_acquire(q_producer_state)
-                        cute.copy(
-                            q_tma_atom,
-                            tQgQ[(None, 0, 0)],
-                            tQsQ[(None, q_producer_state.index)],
-                            tma_bar_ptr=q_pipe.producer_get_barrier(
-                                q_producer_state
-                            ),
-                            mcast_mask=q_mcast_mask,
-                        )
-                        q_producer_state.advance()
-                    task_idx += cutlass.Int32(self.num_persistent_clusters)
-                worker_base = (
-                    worker_base + task_count
-                ) % cutlass.Int32(self.num_persistent_clusters)
+                    gQ = cute.local_tile(
+                        mQ_task,
+                        cute.slice_(self.mma_tiler_mnk, (None, 0, None)),
+                        (None, None),
+                    )
+                    tCgQ = thr_mma.partition_A(gQ)
+                    tQsQ, tQgQ = cpasync.tma_partition(
+                        q_tma_atom,
+                        cta_coord_vmnk[2],
+                        cute.make_layout(
+                            cute.size(cta_layout_vmnk, mode=[2])
+                        ),
+                        cute.group_modes(sQ, 0, 3),
+                        cute.group_modes(tCgQ, 0, 3),
+                    )
+                    q_pipe.producer_acquire(q_producer_state)
+                    cute.copy(
+                        q_tma_atom,
+                        tQgQ[(None, 0, 0)],
+                        tQsQ[(None, q_producer_state.index)],
+                        tma_bar_ptr=q_pipe.producer_get_barrier(
+                            q_producer_state
+                        ),
+                        mcast_mask=q_mcast_mask,
+                    )
+                    q_producer_state.advance()
+                code = self._task_pop(
+                    sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+                )
+                task_seq += cutlass.Int32(1)
             q_pipe.producer_tail(q_producer_state)
         elif warp_idx == self.k_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
@@ -694,73 +893,73 @@ class Q8KV8PrefillIndexerSm100:
                 pipeline.PipelineUserType.Producer,
                 self.k_stages,
             )
-            # Buckets in decreasing cost; cluster c takes every N-th task of each,
-            # and the start rotates by each bucket's count so leftovers spread out.
-            worker_base = cutlass.Int32(0)
-            for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
-                bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                task_count = mTaskCounts[bucket]
-                task_idx = cluster_idx - worker_base
-                if task_idx < cutlass.Int32(0):
-                    task_idx += cutlass.Int32(self.num_persistent_clusters)
-                while task_idx < task_count:
-                    (
-                        batch_idx,
-                        _,
-                        _,
-                        page_begin,
-                        _,
-                        page_count,
-                    ) = self._get_task_descriptor(
-                        bucket,
-                        task_idx,
-                        mTaskDescriptors,
+            task_seq = cutlass.Int32(0)
+            queue_domain = cutlass.Int32(0)
+            stealing = cutlass.Int32(0)
+            code = cutlass.Int32(-1)
+            if is_leader_cta:
+                if cutlass.const_expr(self.locality_steer):
+                    queue_domain = self._cluster_domain(mSmDomains)
+                code, queue_domain, stealing = self._task_push(
+                    sTask, task_full_mbar, task_empty_mbar, task_seq,
+                    mTaskQueue, mTaskCounts, queue_domain, stealing,
+                )
+            else:
+                code = self._task_pop(
+                    sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+                )
+            task_seq += cutlass.Int32(1)
+            while code >= cutlass.Int32(0):
+                bucket, task_idx, task_domain = self._decode_task(code)
+                (
+                    batch_idx,
+                    _,
+                    _,
+                    page_begin,
+                    _,
+                    page_count,
+                ) = self._get_task_descriptor(
+                    bucket,
+                    task_idx,
+                    mTaskDescriptors,
+                )
+                # The physical page index is a dependent global load on the TMA
+                # issue path; fetch the next page's index while this page's TMA is
+                # issued. The last iteration re-reads the final entry (in bounds).
+                last_k = page_count - cutlass.Int32(1)
+                physical_page = mPageTable[
+                    batch_idx, self._logical_page(page_begin, cutlass.Int32(0), task_domain)
+                ]
+                for tile_idx in cutlass.range(page_count, unroll=1):
+                    next_k = cutlass.min(tile_idx + cutlass.Int32(1), last_k)
+                    next_physical_page = mPageTable[
+                        batch_idx, self._logical_page(page_begin, next_k, task_domain)
+                    ]
+                    k_pipe.producer_acquire(k_producer_state)
+                    cute.copy(
+                        k_tma_atom,
+                        tKgK[(None, 0, physical_page)],
+                        tKsK[(None, k_producer_state.index)],
+                        tma_bar_ptr=k_pipe.producer_get_barrier(
+                            k_producer_state
+                        ),
+                        mcast_mask=k_mcast_mask,
                     )
-                    if cutlass.const_expr(self.compute_capability == (10, 7)):
-                        # The physical page index is a dependent global load on
-                        # the TMA issue path; fetch the next page's index while
-                        # this page's TMA is issued so the two latencies overlap.
-                        # The last iteration re-reads the final entry (in bounds).
-                        last_page = page_begin + page_count - cutlass.Int32(1)
-                        physical_page = mPageTable[batch_idx, page_begin]
-                        for tile_idx in cutlass.range(page_count, unroll=1):
-                            logical_page = page_begin + tile_idx
-                            next_page = cutlass.min(
-                                logical_page + cutlass.Int32(1), last_page
-                            )
-                            next_physical_page = mPageTable[batch_idx, next_page]
-                            k_pipe.producer_acquire(k_producer_state)
-                            cute.copy(
-                                k_tma_atom,
-                                tKgK[(None, 0, physical_page)],
-                                tKsK[(None, k_producer_state.index)],
-                                tma_bar_ptr=k_pipe.producer_get_barrier(
-                                    k_producer_state
-                                ),
-                                mcast_mask=k_mcast_mask,
-                            )
-                            k_producer_state.advance()
-                            physical_page = next_physical_page
-                    else:
-                        physical_page = cutlass.Int32(0)
-                        for tile_idx in cutlass.range(page_count, unroll=1):
-                            logical_page = page_begin + tile_idx
-                            physical_page = mPageTable[batch_idx, logical_page]
-                            k_pipe.producer_acquire(k_producer_state)
-                            cute.copy(
-                                k_tma_atom,
-                                tKgK[(None, 0, physical_page)],
-                                tKsK[(None, k_producer_state.index)],
-                                tma_bar_ptr=k_pipe.producer_get_barrier(
-                                    k_producer_state
-                                ),
-                                mcast_mask=k_mcast_mask,
-                            )
-                            k_producer_state.advance()
-                    task_idx += cutlass.Int32(self.num_persistent_clusters)
-                worker_base = (
-                    worker_base + task_count
-                ) % cutlass.Int32(self.num_persistent_clusters)
+                    k_producer_state.advance()
+                    physical_page = next_physical_page
+                # Claim the next task only once this task's pages are all issued.
+                if is_leader_cta:
+                    code, queue_domain, stealing = self._task_push(
+                        sTask, task_full_mbar, task_empty_mbar, task_seq,
+                        mTaskQueue, mTaskCounts, queue_domain, stealing,
+                    )
+                else:
+                    code = self._task_pop(
+                        sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+                    )
+                task_seq += cutlass.Int32(1)
+            if is_leader_cta:
+                self._task_queue_exit(mTaskQueue)
             k_pipe.producer_tail(k_producer_state)
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
@@ -778,79 +977,76 @@ class Q8KV8PrefillIndexerSm100:
             )
             num_k_blocks = cute.size(tCrQ, mode=[2])
             if is_leader_cta:
-                # Buckets in decreasing cost; cluster c takes every N-th task of each,
-                # and the start rotates by each bucket's count so leftovers spread out.
-                worker_base = cutlass.Int32(0)
-                for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
-                    bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                    task_count = mTaskCounts[bucket]
-                    task_idx = cluster_idx - worker_base
-                    if task_idx < cutlass.Int32(0):
-                        task_idx += cutlass.Int32(self.num_persistent_clusters)
-                    while task_idx < task_count:
-                        (
-                            _,
-                            _,
-                            _,
-                            _,
-                            _,
-                            page_count,
-                        ) = self._get_task_descriptor(
-                            bucket,
-                            task_idx,
-                            mTaskDescriptors,
-                        )
-                        q_pipe.consumer_wait(q_consumer_state)
-                        for _ in cutlass.range(page_count, unroll=1):
-                            k_pipe.consumer_wait(k_consumer_state)
-                            acc_pipe.producer_acquire(acc_producer_state)
-                            tCtAcc = tCtAcc_staged[
-                                (
-                                    None,
-                                    None,
-                                    None,
-                                    acc_producer_state.index,
-                                )
-                            ]
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                            for k_block_idx in cutlass.range_constexpr(
-                                num_k_blocks
-                            ):
-                                cute.gemm(
-                                    tiled_mma,
-                                    tCtAcc,
-                                    tCrQ[
-                                        (
-                                            None,
-                                            None,
-                                            k_block_idx,
-                                            q_consumer_state.index,
-                                        )
-                                    ],
-                                    tCrK[
-                                        (
-                                            None,
-                                            None,
-                                            k_block_idx,
-                                            k_consumer_state.index,
-                                        )
-                                    ],
-                                    tCtAcc,
-                                )
-                                tiled_mma.set(
-                                    tcgen05.Field.ACCUMULATE,
-                                    True,
-                                )
-                            k_pipe.consumer_release(k_consumer_state)
-                            k_consumer_state.advance()
-                            acc_pipe.producer_commit(acc_producer_state)
-                            acc_producer_state.advance()
-                        q_pipe.consumer_release(q_consumer_state)
-                        q_consumer_state.advance()
-                        task_idx += cutlass.Int32(self.num_persistent_clusters)
-                    worker_base = (
-                        worker_base + task_count
-                    ) % cutlass.Int32(self.num_persistent_clusters)
+                task_seq = cutlass.Int32(0)
+                code = self._task_pop(
+                    sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+                )
+                task_seq += cutlass.Int32(1)
+                while code >= cutlass.Int32(0):
+                    bucket, task_idx, _ = self._decode_task(code)
+                    (
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        page_count,
+                    ) = self._get_task_descriptor(
+                        bucket,
+                        task_idx,
+                        mTaskDescriptors,
+                    )
+                    q_pipe.consumer_wait(q_consumer_state)
+                    for _ in cutlass.range(page_count, unroll=1):
+                        k_pipe.consumer_wait(k_consumer_state)
+                        acc_pipe.producer_acquire(acc_producer_state)
+                        tCtAcc = tCtAcc_staged[
+                            (
+                                None,
+                                None,
+                                None,
+                                acc_producer_state.index,
+                            )
+                        ]
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        for k_block_idx in cutlass.range_constexpr(
+                            num_k_blocks
+                        ):
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrQ[
+                                    (
+                                        None,
+                                        None,
+                                        k_block_idx,
+                                        q_consumer_state.index,
+                                    )
+                                ],
+                                tCrK[
+                                    (
+                                        None,
+                                        None,
+                                        k_block_idx,
+                                        k_consumer_state.index,
+                                    )
+                                ],
+                                tCtAcc,
+                            )
+                            tiled_mma.set(
+                                tcgen05.Field.ACCUMULATE,
+                                True,
+                            )
+                        k_pipe.consumer_release(k_consumer_state)
+                        k_consumer_state.advance()
+                        acc_pipe.producer_commit(acc_producer_state)
+                        acc_producer_state.advance()
+                    q_pipe.consumer_release(q_consumer_state)
+                    q_consumer_state.advance()
+                    code = self._task_pop(
+                        sTask, task_full_mbar, task_empty_mbar, task_seq, is_leader_cta
+                    )
+                    task_seq += cutlass.Int32(1)
                 acc_pipe.producer_tail(acc_producer_state)
         else:
             # Warp 7 completes the second 4-warp warpgroup.
