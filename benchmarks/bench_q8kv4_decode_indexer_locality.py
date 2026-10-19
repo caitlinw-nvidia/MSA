@@ -566,6 +566,15 @@ class BatchDecodeIndexerWithPagedKVCacheWrapper:
         return self.wrapper.run(q.view(batch * query_length, num_heads, head_dim), k_cache, out=out)
 
 
+def _parity_randperm(pages: int, generator: torch.Generator, device: torch.device) -> torch.Tensor:
+    """A random permutation of range(pages) that keeps even and odd positions separate."""
+    permutation = torch.empty(pages, dtype=torch.int64, device=device)
+    for parity in range(2):
+        count = (pages + 1 - parity) // 2
+        permutation[parity::2] = 2 * torch.randperm(count, generator=generator, device=device) + parity
+    return permutation
+
+
 def _make_slot(
     case: DecodeCase,
     lengths_cpu: torch.Tensor,
@@ -611,25 +620,26 @@ def _make_slot(
         physical_indices = torch.arange(
             physical_pages, dtype=torch.int32, device=device
         ).reshape(case.batch, max_pages)
-        page_table = torch.stack(
-            [
-                physical_indices[batch_index][
-                    torch.randperm(max_pages, generator=generator, device=device)
-                ]
-                for batch_index in range(case.batch)
-            ]
-        ).contiguous()
     else:
-        # Logical page j of every request lives in locality domain j % 2.
-        cpu_generator = torch.Generator().manual_seed(seed)
-        columns = (max_pages + 1 - torch.arange(2)) // 2
-        page_table = torch.empty(case.batch, max_pages, dtype=torch.int32)
+        # Logical page j of every request lives in locality domain j % 2: each request owns a
+        # block of domain-0 pages for its even slots and a block of domain-1 pages for its odd slots.
+        physical_indices = torch.empty(case.batch, max_pages, dtype=torch.int32, device=device)
         for domain in range(2):
-            pages = torch.nonzero(page_domain == domain).flatten()
-            need = case.batch * int(columns[domain])
-            pages = pages[torch.randperm(pages.numel(), generator=cpu_generator)][:need]
-            page_table[:, domain::2] = pages.view(case.batch, -1).to(torch.int32)
-        page_table = page_table.to(device).contiguous()
+            pages = torch.nonzero(page_domain == domain).flatten().to(torch.int32)
+            columns = (max_pages + 1 - domain) // 2
+            physical_indices[:, domain::2] = (
+                pages[: case.batch * columns].reshape(case.batch, columns).to(device)
+            )
+    page_table = torch.stack(
+        [
+            physical_indices[batch_index][
+                torch.randperm(max_pages, generator=generator, device=device)
+                if page_domain is None
+                else _parity_randperm(max_pages, generator, device)
+            ]
+            for batch_index in range(case.batch)
+        ]
+    ).contiguous()
     seq_lens = lengths_cpu.to(device=device)
     q = q.unsqueeze(2)
     if num_index_heads > 1:
