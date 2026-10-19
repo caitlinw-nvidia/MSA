@@ -62,3 +62,20 @@ yet known (board/firmware, driver, or software stack).
 
 Tested against `dc762bd`; this branch's base adds #34, which changes `q8_indexer_interface.py`
 (one-head dispatch). The two-/four-head path the harness uses was not rerun on this base.
+
+## Repository-style benchmark (not yet run)
+
+`benchmarks/bench_q8kv4_decode_indexer_locality.py` is `benchmarks/bench_q8kv4_decode_indexer.py`
+with a localized arm added, so `diff` of the two files shows only the locality changes. Both arms
+are timed exactly as the repository benchmark times `run()` (scores + TopK, cold-L2 slot rotation,
+CUDA graphs, CV gate), and every valid score and TopK entry of the localized arm is compared
+bitwise with the plain arm. It takes PR #38's locality functions from the Q8KV4 prefill
+extension itself (`fmha_sm100.prefill_q8kv4.jit.load_extension`), so its first run builds that
+extension. Two and four index heads, query length 8:
+
+```bash
+python benchmarks/bench_q8kv4_decode_indexer_locality.py --suite full --num-index-heads 4 --out h4.json
+```
+
+This script compiles but has not been run yet; the results above come from `bench_pr38_cases.py`
+(score kernel only).
