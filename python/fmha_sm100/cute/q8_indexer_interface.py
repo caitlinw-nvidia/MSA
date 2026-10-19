@@ -63,6 +63,10 @@ _TMA_ALIGNMENT = 16
 # seq_lens[lo:hi] only need int32 alignment.
 _SCALAR_ALIGNMENT = torch.int32.itemsize
 _PREFILL_TASK_CAPACITY_PAGE_CHUNK = 4
+# Target tasks per persistent cluster: clusters claim tasks dynamically, largest
+# first, so several smaller tasks per cluster let the queue balance the causal
+# page counts across SMs.
+_PREFILL_TASKS_PER_CLUSTER = 4
 _SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
 # Kernels plus this interface, which fixes the compiled argument alignments.
 _CODEGEN_SOURCES = (
@@ -599,6 +603,7 @@ class _PrefillPlanState:
     block_table: torch.Tensor
     task_descriptors: torch.Tensor
     task_counts: torch.Tensor
+    task_clusters: int
     plan_error: torch.Tensor
     task_capacity: int
     num_candidate_q_tiles: int
@@ -725,8 +730,14 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         # machine in one wave instead of leaving most clusters idle. Host-known
         # upper bounds only (no D2H); long-query batches keep the default chunk.
         if _require_supported_device(device) == (10, 7):
-            num_clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
-            chunks_per_q_tile = max(1, num_clusters // q_tile_capacity)
+            num_clusters = (
+                _sm_count(device)
+                * getattr(Q8KV8PrefillIndexerSm100, "ctas_per_sm", 1)
+                // Q8KV8PrefillIndexerSm100.cta_group_size
+            )
+            chunks_per_q_tile = max(
+                1, num_clusters * _PREFILL_TASKS_PER_CLUSTER // q_tile_capacity
+            )
             max_page_chunk = max(
                 Q8KV8PrefillIndexerPlanBuild.min_page_chunk,
                 min(
@@ -752,6 +763,18 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             ),
             task_counts=torch.empty(
                 (Q8KV8PrefillIndexerPlanBuild.num_buckets,), dtype=torch.int32, **options
+            ),
+            # Launch-time upper bound on the planned task count (one cluster per
+            # task). A Q tile splits into chunks of at least
+            # min(split_page_chunk, max_page_chunk) pages, or one task when it has
+            # fewer pages; clusters past the planned count exit at kernel entry.
+            task_clusters=max(
+                1,
+                q_tile_capacity
+                * -(
+                    -max_pages
+                    // min(Q8KV8PrefillIndexerPlanBuild.split_page_chunk, max_page_chunk)
+                ),
             ),
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
@@ -784,10 +807,19 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         _check_query(q, state.total_q, state.num_heads, device)
         _check_paged_cache(k_cache, dtype=torch.float8_e4m3fn, page_width=_HEAD_DIM, device=device)
         capability = _require_supported_device(device)
-        num_persistent_clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
+        num_persistent_clusters = (
+            _sm_count(device)
+            * getattr(Q8KV8PrefillIndexerSm100, "ctas_per_sm", 1)
+            // Q8KV8PrefillIndexerSm100.cta_group_size
+        )
         # Q rows are token * num_heads + head, matching the scores and TopK rows.
         q_rows = q.view(state.total_q * state.num_heads, 1, _HEAD_DIM)
-        metadata = (state.block_table, state.scores, state.task_descriptors, state.task_counts)
+        metadata = (
+            state.block_table,
+            state.scores,
+            state.task_descriptors,
+            state.task_counts,
+        )
         compiled = _compile_or_load(
             _cute_kernel_key(
                 "q8kv8_indexer_prefill_sm100",
@@ -803,12 +835,13 @@ class BatchPrefillIndexerQ8KV8Wrapper:
                     num_persistent_clusters=num_persistent_clusters,
                 ),
                 *_cute_arguments((q_rows, k_cache), metadata),
+                Int32(state.task_clusters),
                 Int32(state.num_heads),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             ),
         )
-        compiled(q_rows, k_cache, *metadata, state.num_heads)
+        compiled(q_rows, k_cache, *metadata, state.task_clusters, state.num_heads)
         return state.scores
 
     def run(
