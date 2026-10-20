@@ -746,6 +746,30 @@ def test_metadata_slices_need_only_int32_alignment(phase, num_heads):
     assert torch.equal(results[0], results[1])
 
 
+def test_prefill_singleton_block_table_with_zero_strides():
+    """A one-request, one-page block table may be contiguous yet carry zero strides.
+
+    ``scalar.expand(1, 1).clone()`` keeps strides (0, 0) and ``contiguous()``
+    leaves them, while CuTe DSL's ``mark_layout_dynamic`` needs a unit stride on
+    the leading dim of the compile exemplar.
+    """
+
+    table = torch.tensor([3], dtype=torch.int32, device="cuda")[0].expand(1, 1).clone()
+    assert table.stride() == (0, 0) and table.is_contiguous()
+    q8_indexer_interface._to_cute_tensor(table, assumed_align=torch.int32.itemsize)
+
+    inputs = _make_prefill([1], [0], seed=23)
+    assert inputs["block_table"].shape == (1, 1)
+    zero_stride = inputs["block_table"][0, 0].expand(1, 1).clone()
+    assert zero_stride.stride() == (0, 0)
+    results = []
+    for block_table in (inputs["block_table"], zero_stride):
+        wrapper = BatchPrefillIndexerQ8KV8Wrapper(num_heads=1)
+        _plan_prefill(wrapper, {**inputs, "block_table": block_table})
+        results.append(wrapper.run(inputs["q"], inputs["k"].cache).clone())
+    assert torch.equal(results[0], results[1])
+
+
 _VENDORED_LAYOUT_CHECK = """
 import importlib.util
 import sys

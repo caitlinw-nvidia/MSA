@@ -122,6 +122,12 @@ def _stream_ptr(device: torch.device) -> int:
 
 
 def _to_cute_tensor(tensor: torch.Tensor, *, assumed_align: int) -> cute.Tensor:
+    if tensor.stride(-1) != 1 and tensor.is_contiguous():
+        # PyTorch ignores the strides of size-1 dims, so a contiguous tensor can
+        # still report a non-unit leading stride: scalar.expand(1, 1).clone() keeps
+        # strides (0, 0). These tensors only serve as cute.compile exemplars, so a
+        # dense one of the same shape and dtype compiles the same kernel.
+        tensor = torch.empty_like(tensor, memory_format=torch.contiguous_format)
     return from_dlpack(
         tensor.detach(),
         assumed_align=assumed_align,
