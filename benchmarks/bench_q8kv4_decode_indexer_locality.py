@@ -752,6 +752,7 @@ def run_case(
     num_index_heads: int = 1,
     query_length: int = 8,
     verify: bool = False,
+    score_only: bool = False,
 ) -> dict[str, object]:
     device = torch.device("cuda")
     properties = torch.cuda.get_device_properties(device)
@@ -858,7 +859,13 @@ def run_case(
                     else call % slots_count
                 )
                 q, packed_k, k_scale, _, _, output = slots[slot_index]
-                wrappers[slot_index].run(q, packed_k, k_scale=k_scale, out=output)
+                if score_only:
+                    # --score-only: time the score kernel without the TopK that follows it.
+                    wrappers[slot_index].wrapper._run_scores(
+                        q.view(case.batch * query_length, num_index_heads, HEAD_DIM), packed_k
+                    )
+                else:
+                    wrappers[slot_index].run(q, packed_k, k_scale=k_scale, out=output)
         graphs.append(graph)
     for graph in graphs:
         graph.replay()
@@ -919,17 +926,20 @@ def run_case(
         )
     localized_kernel = _LOCALIZED_KERNELS[kernel_key]
 
-    def run_localized(arm: str, slot_index: int, launch: int, previous: int) -> None:
+    def run_localized(
+        arm: str, slot_index: int, launch: int, previous: int, topk: bool = True
+    ) -> None:
         arm_counter = arm_counters[arm]
         localized_kernel(
             q_rows[slot_index], arm_caches[arm][slot_index], slots[slot_index][4],
             localized_scores[slot_index], slots[slot_index][3], domain_schedule,
             arm_counter[launch], arm_counter[previous], sm_domains,
         )
-        inner = wrappers[slot_index].wrapper
-        qi._topk_select(
-            localized_scores[slot_index], inner._num_valid_pages, localized_outputs[slot_index]
-        )
+        if topk:
+            inner = wrappers[slot_index].wrapper
+            qi._topk_select(
+                localized_scores[slot_index], inner._num_valid_pages, localized_outputs[slot_index]
+            )
 
     query_rows = torch.arange(query_length).reshape(1, -1, 1)
     row_pages = torch.div(
@@ -969,7 +979,9 @@ def run_case(
                         else call % slots_count
                     )
                     launch = graph_index * graph_calls + call
-                    run_localized(arm, slot_index, launch, (launch - 1) % launches)
+                    run_localized(
+                        arm, slot_index, launch, (launch - 1) % launches, topk=not score_only
+                    )
             arm_graphs.append(graph)
         arm_microseconds, arm_cv = _time_graphs(
             arm_graphs,
@@ -1059,6 +1071,7 @@ def run_case(
         "reuse_distance_over_l2": reuse_distance_bytes / l2_bytes,
         "device": properties.name,
         "e2e_scope": "fmha_sm100 BatchDecodeIndexerQ8KV4Wrapper.run",
+        "timed_scope": "score kernel" if score_only else "score kernel + TopK",
         "correctness": ("full reference passed" if verify else "TopK graph replay only")
         + "; localized and schedule-only arms bitwise equal",
         **roofline_metrics(
@@ -1096,6 +1109,11 @@ def main() -> None:
     parser.add_argument("--num-index-heads", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--query-length", type=int, choices=range(1, 17), default=8)
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument(
+        "--score-only",
+        action="store_true",
+        help="time every arm's score kernel without TopK (checks still run TopK eagerly)",
+    )
     args = parser.parse_args()
     if args.slots < 0 or args.graph_calls < 1:
         parser.error("--slots must be non-negative and --graph-calls must be positive")
@@ -1140,6 +1158,7 @@ def main() -> None:
             num_index_heads=args.num_index_heads,
             query_length=args.query_length,
             verify=args.verify,
+            score_only=args.score_only,
         )
         result["suite"] = args.suite
         results.append(result)
@@ -1191,6 +1210,7 @@ def main() -> None:
         "dsl_version": importlib.metadata.version("nvidia-cutlass-dsl"),
         "protocol": {
             "suite": args.suite,
+            "score_only": args.score_only,
             "formal": formal
             or (
                 args.suite == "low-latency"
