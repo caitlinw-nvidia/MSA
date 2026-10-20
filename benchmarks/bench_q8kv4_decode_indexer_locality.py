@@ -19,7 +19,10 @@ the two memory locality domains), logical page j of every request lives in domai
 and q8kv4_indexer_decode_localized scores each domain's pages on that domain's SMs
 (sm_locality_domains). Both arms use the same page table and bytes; the localized arm
 runs its score kernel plus the same TopK, so both times cover scores + TopK. TopK and
-every valid score are compared bitwise. Two and four index heads only.
+every valid score are compared bitwise. A schedule-only arm runs the localized kernel on
+the ordinary K cache: the same per-domain scheduling without locality, so plain ->
+schedule-only is the scheduling effect and schedule-only -> localized the locality effect.
+Two and four index heads only.
 """
 
 from __future__ import annotations
@@ -891,8 +894,13 @@ def run_case(
     localized_outputs = [torch.empty_like(slot[-1]) for slot in slots]
     q_rows = [slot[0].view(case.batch * query_length, num_index_heads, HEAD_DIM) for slot in slots]
     launches = graph_count * graph_calls
-    # One counter pair per launch in replay order; launch k zeroes launch k - 1's pair.
-    counters = torch.zeros((launches + 2, 2), dtype=torch.int32, device=device)
+    # One counter pair per launch in replay order; launch k zeroes launch k - 1's pair. Each
+    # arm (striped K: localized; ordinary K: schedule-only) has its own counters.
+    arm_caches = {"localized": localized_caches, "schedule_only": [slot[1] for slot in slots]}
+    arm_counters = {
+        arm: torch.zeros((launches + 2, 2), dtype=torch.int32, device=device) for arm in arm_caches
+    }
+    counters = arm_counters["localized"]
     kernel_key = (num_index_heads, domain_ctas)
     if kernel_key not in _LOCALIZED_KERNELS:
         _LOCALIZED_KERNELS[kernel_key] = cute.compile(
@@ -911,58 +919,72 @@ def run_case(
         )
     localized_kernel = _LOCALIZED_KERNELS[kernel_key]
 
-    def run_localized(slot_index: int, launch: int, previous: int) -> None:
+    def run_localized(arm: str, slot_index: int, launch: int, previous: int) -> None:
+        arm_counter = arm_counters[arm]
         localized_kernel(
-            q_rows[slot_index], localized_caches[slot_index], slots[slot_index][4],
+            q_rows[slot_index], arm_caches[arm][slot_index], slots[slot_index][4],
             localized_scores[slot_index], slots[slot_index][3], domain_schedule,
-            counters[launch], counters[previous], sm_domains,
+            arm_counter[launch], arm_counter[previous], sm_domains,
         )
         inner = wrappers[slot_index].wrapper
         qi._topk_select(
-            localized_scores[slot_index], inner._num_valid_pages,
-            localized_outputs[slot_index], use_pdl=False,
+            localized_scores[slot_index], inner._num_valid_pages, localized_outputs[slot_index]
         )
 
-    for slot_index in range(slots_count):
-        spare = launches + slot_index % 2
-        run_localized(slot_index, spare, launches + (slot_index + 1) % 2)
-    torch.cuda.synchronize()
-    counters.zero_()
     query_rows = torch.arange(query_length).reshape(1, -1, 1)
     row_pages = torch.div(
         lengths_cpu.reshape(-1, 1, 1) - query_length + query_rows, PAGE_SIZE, rounding_mode="floor"
     ).expand(-1, -1, num_index_heads).reshape(case.batch, query_length * num_index_heads, 1)
     valid_mask = (torch.arange(max_pages).reshape(1, 1, -1) < row_pages).to(device)
-    score_mismatches = topk_mismatches = 0
-    for slot_index in range(slots_count):
-        inner = wrappers[slot_index].wrapper
-        reference = inner._scores.view(torch.int32)[:, :, :max_pages]
-        score_mismatches += int((reference != localized_scores[slot_index].view(torch.int32))[valid_mask].sum())
-        topk_mismatches += int((expected_outputs[slot_index] != localized_outputs[slot_index]).sum())
-    if score_mismatches or topk_mismatches:
-        raise RuntimeError(
-            f"localized arm differs: {score_mismatches} scores, {topk_mismatches} TopK entries"
+    arm_results = {}
+    for arm in arm_caches:
+        # The arms share the score and TopK buffers: poison them so each arm is checked on its
+        # own writes.
+        for scores, outputs in zip(localized_scores, localized_outputs, strict=True):
+            scores.fill_(float("nan"))
+            outputs.fill_(-2)
+        for slot_index in range(slots_count):
+            spare = launches + slot_index % 2
+            run_localized(arm, slot_index, spare, launches + (slot_index + 1) % 2)
+        torch.cuda.synchronize()
+        arm_counters[arm].zero_()
+        score_mismatches = topk_mismatches = 0
+        for slot_index in range(slots_count):
+            inner = wrappers[slot_index].wrapper
+            reference = inner._scores.view(torch.int32)[:, :, :max_pages]
+            score_mismatches += int((reference != localized_scores[slot_index].view(torch.int32))[valid_mask].sum())
+            topk_mismatches += int((expected_outputs[slot_index] != localized_outputs[slot_index]).sum())
+        if score_mismatches or topk_mismatches:
+            raise RuntimeError(
+                f"{arm} arm differs: {score_mismatches} scores, {topk_mismatches} TopK entries"
+            )
+        arm_graphs = []
+        for graph_index in range(graph_count):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for call in range(graph_calls):
+                    slot_index = (
+                        graph_index * graph_calls + call
+                        if slots_count > graph_calls
+                        else call % slots_count
+                    )
+                    launch = graph_index * graph_calls + call
+                    run_localized(arm, slot_index, launch, (launch - 1) % launches)
+            arm_graphs.append(graph)
+        arm_microseconds, arm_cv = _time_graphs(
+            arm_graphs,
+            graph_calls=graph_calls,
+            warmup=warmup,
+            replays=replays,
         )
-    localized_graphs = []
-    for graph_index in range(graph_count):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for call in range(graph_calls):
-                slot_index = (
-                    graph_index * graph_calls + call
-                    if slots_count > graph_calls
-                    else call % slots_count
-                )
-                launch = graph_index * graph_calls + call
-                run_localized(slot_index, launch, (launch - 1) % launches)
-        localized_graphs.append(graph)
-    localized_microseconds, localized_cv = _time_graphs(
-        localized_graphs,
-        graph_calls=graph_calls,
-        warmup=warmup,
-        replays=replays,
-    )
-    localized_latency_us = statistics.median(localized_microseconds)
+        arm_results[arm] = (
+            statistics.median(arm_microseconds), arm_microseconds, arm_cv,
+            score_mismatches, topk_mismatches,
+        )
+    (localized_latency_us, localized_microseconds, localized_cv,
+     score_mismatches, topk_mismatches) = arm_results["localized"]
+    (schedule_only_latency_us, schedule_only_microseconds, schedule_only_cv,
+     schedule_only_score_mismatches, schedule_only_topk_mismatches) = arm_results["schedule_only"]
     flops = 2 * num_index_heads * valid_scores * PAGE_SIZE * HEAD_DIM
     output_bytes = num_index_heads * case.batch * query_length * 16 * 4
     logical_bytes = necessary_bytes(
@@ -1016,6 +1038,11 @@ def run_case(
         "localized_reduction_pct": 100.0 * (latency_us - localized_latency_us) / latency_us,
         "localized_score_mismatches": score_mismatches,
         "localized_topk_mismatches": topk_mismatches,
+        "schedule_only_latency_us": schedule_only_latency_us,
+        "schedule_only_latency_us_samples": schedule_only_microseconds,
+        "schedule_only_cv": schedule_only_cv,
+        "schedule_only_score_mismatches": schedule_only_score_mismatches,
+        "schedule_only_topk_mismatches": schedule_only_topk_mismatches,
         "locality_domain_sms": domain_sms,
         "locality_domain_ctas": list(domain_ctas),
         "locality_page_bytes": locality_page,
@@ -1033,7 +1060,7 @@ def run_case(
         "device": properties.name,
         "e2e_scope": "fmha_sm100 BatchDecodeIndexerQ8KV4Wrapper.run",
         "correctness": ("full reference passed" if verify else "TopK graph replay only")
-        + "; localized arm bitwise equal",
+        + "; localized and schedule-only arms bitwise equal",
         **roofline_metrics(
             device_name=properties.name,
             useful_flops=flops,
@@ -1139,6 +1166,11 @@ def main() -> None:
                 for case, result in zip(cases, results, strict=True)
             )
             / total_weight,
+            "weighted_mean_schedule_only_latency_us": sum(
+                case.weight * float(result["schedule_only_latency_us"])
+                for case, result in zip(cases, results, strict=True)
+            )
+            / total_weight,
             "weighted_effective_mbu": sum(
                 case.weight * row["necessary_bytes"]
                 for case, row in zip(cases, results, strict=True)
@@ -1169,7 +1201,8 @@ def main() -> None:
                 and args.graph_calls == 120
             ),
             "e2e_scope": "public wrapper.run (proxy GEMM + TopK); localized: localized "
-            "proxy GEMM + the same TopK",
+            "proxy GEMM + the same TopK (PDL) on the striped K pool; schedule-only: the same "
+            "on the ordinary K cache",
             "cuda_graph_calls": args.graph_calls,
             "query_length": args.query_length,
             "warmup_replays": args.warmup,
