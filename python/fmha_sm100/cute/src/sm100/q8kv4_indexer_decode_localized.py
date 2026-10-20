@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""CuTe DSL Q8KV4 paged decode indexer proxy scores for two or four index heads.
+"""K-localized (page-parity) variant of the Q8KV4 2/4-head decode indexer (experiment).
+
+Built from 736f507. Logical page j of every request lives in memory locality
+domain j % 2; CTAs of domain d score logical pages d, d + 2, ... of every request
+(per-domain prefix sums, per-launch claim counters with stealing). Per-page math is
+unchanged, so scores are bitwise identical to Q8KV4DecodeIndexerSm100.
+
+Original module docstring:
+CuTe DSL Q8KV4 paged decode indexer proxy scores for two or four index heads.
 
 K pages use the vLLM packed NVFP4 layout: 8192 bytes of E2M1 values (64 bytes
 per token, low nibble first) followed by 1024 bytes of E4M3 scales for groups
@@ -180,13 +188,17 @@ def _e4m3x4_to_f16x4(word: Int32, *, loc=None, ip=None) -> tuple[Int32, Int32]:
     )
 
 
+NUM_DOMAINS = 2
+
+
 class _NamedBarrier(enum.IntEnum):
     TmemPtr = enum.auto()
     Score = enum.auto()
     Final = enum.auto()
+    Claim = enum.auto()
 
 
-class Q8KV4DecodeIndexerSm100:
+class Q8KV4DecodeIndexerLocalizedSm100:
     """Compute NVFP4-K page scores for two or four index heads with persistent workers.
 
     The heads share the single K head, so the eight MTP tokens of all heads
@@ -257,7 +269,7 @@ class Q8KV4DecodeIndexerSm100:
     k_per_tmem_col = e4m3_per_tmem_col
     dequant_store_halves = 1
 
-    def __init__(self, *, sm_count: int, num_heads: int) -> None:
+    def __init__(self, *, sm_count: int, num_heads: int, domain_ctas: tuple[int, int]) -> None:
         if sm_count <= 0:
             raise ValueError("sm_count must be positive")
         if num_heads not in self.supported_num_heads:
@@ -319,16 +331,24 @@ class Q8KV4DecodeIndexerSm100:
         # One scale byte covers two packed words, so SM107 converts each of a
         # row's eight scales to f16x2 once per page instead of once per word.
         self.hoist_scale_cvt = is_rubin and not self.use_qmul4
+        if len(domain_ctas) != NUM_DOMAINS or min(domain_ctas) <= 0:
+            raise ValueError("domain_ctas needs a positive CTA count per domain")
+        if sum(domain_ctas) != self.grid_ctas:
+            raise ValueError(f"domain_ctas {domain_ctas} must sum to the grid ({self.grid_ctas})")
+        self.domain_ctas = tuple(int(c) for c in domain_ctas)
 
     @cute.jit
     def __call__(
         self,
         mQ: cute.Tensor,
         mKCache: cute.Tensor,
-        mPageTable: cute.Tensor,
         mSeqLens: cute.Tensor,
         mOut: cute.Tensor,
-        mSchedulerStorage: cute.Tensor,
+        mPageTable: cute.Tensor,
+        mDomSched: cute.Tensor,
+        mCounters: cute.Tensor,
+        mClearCounters: cute.Tensor,
+        mSmDomains: cute.Tensor,
         stream: cuda.CUstream = None,
     ) -> None:
         if cutlass.const_expr(mQ.element_type is not cutlass.Float8E4M3FN):
@@ -377,10 +397,6 @@ class Q8KV4DecodeIndexerSm100:
         mOut_pqb = cute.make_tensor(
             mOut.iterator,
             cute.select(mOut.layout, mode=[2, 1, 0]),
-        )
-        mScheduler = cute.make_tensor(
-            cute.recast_ptr(mSchedulerStorage.iterator, dtype=Int32),
-            cute.make_layout(batch_size + 1),
         )
 
         qk_tiler = (self.m_tile, self.n_tile, self.k_tile)
@@ -490,6 +506,7 @@ class Q8KV4DecodeIndexerSm100:
             acc_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stages * 2]
             tmem_holding_buf: Int32
             tmem_holding_buf2: Int32
+            claim: cute.struct.MemRange[Int32, 2]
             sPacked: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint8, cute.cosize(sPacked_layout)], 1024
             ]
@@ -522,7 +539,10 @@ class Q8KV4DecodeIndexerSm100:
             mPageTable_lb,
             mSeqLens,
             mOut_pqb,
-            mScheduler,
+            mDomSched,
+            mCounters,
+            mClearCounters,
+            mSmDomains,
             batch_size,
             query_rows,
             sPacked_layout,
@@ -540,6 +560,38 @@ class Q8KV4DecodeIndexerSm100:
             use_pdl=True,
         )
 
+    @cute.jit
+    def _claim(self, mCounters: cute.Tensor, mSmDomains: cute.Tensor) -> tuple[Int32, Int32]:
+        """Thread 0 only: the (domain, slot) this CTA scores, or slot -1.
+
+        ``mCounters`` is this launch's own pair of slot counters; the next
+        launch zeroes it after its PDL wait, so no CTA here has to detect the
+        end of the claims or reset anything.
+        """
+
+        # The SM's memory locality domain from sm_locality_domains (PR #38's
+        # locality_domains.cu), indexed by %smid.
+        domain = mSmDomains[cute.arch.smid()]
+        slot = cute.arch.atomic_add(
+            (mCounters.iterator + domain).llvm_ptr, Int32(1), sem="relaxed", scope="gpu"
+        )
+        domain_slots = Int32(self.domain_ctas[0])
+        if domain == Int32(1):
+            domain_slots = Int32(self.domain_ctas[1])
+        if slot >= domain_slots:
+            # Own domain exhausted (more of this domain's SMs ran CTAs than it
+            # has slots): take a slot of the other domain.
+            domain = domain ^ Int32(1)
+            slot = cute.arch.atomic_add(
+                (mCounters.iterator + domain).llvm_ptr, Int32(1), sem="relaxed", scope="gpu"
+            )
+            domain_slots = Int32(self.domain_ctas[0])
+            if domain == Int32(1):
+                domain_slots = Int32(self.domain_ctas[1])
+            if slot >= domain_slots:
+                slot = Int32(-1)
+        return domain, slot
+
     @cute.kernel
     def kernel(
         self,
@@ -554,7 +606,10 @@ class Q8KV4DecodeIndexerSm100:
         mPageTable_lb: cute.Tensor,
         mSeqLens: cute.Tensor,
         mOut_pqb: cute.Tensor,
-        mScheduler: cute.Tensor,
+        mDomSched: cute.Tensor,
+        mCounters: cute.Tensor,
+        mClearCounters: cute.Tensor,
+        mSmDomains: cute.Tensor,
         batch_size: Int32,
         query_rows: Int32,
         sPacked_layout: cute.ComposedLayout,
@@ -567,7 +622,6 @@ class Q8KV4DecodeIndexerSm100:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()
-        worker_idx, _, _ = cute.arch.block_idx()
 
         if warp_idx == Int32(1):
             cpasync.prefetch_descriptor(tma_atom_packed)
@@ -579,6 +633,13 @@ class Q8KV4DecodeIndexerSm100:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        sClaim = storage.claim.get_tensor(cute.make_layout(2))
+        # Claim first: the counters do not depend on the predecessor, so the atomic
+        # overlaps its tail and the setup below instead of following the PDL wait.
+        if tidx == Int32(0):
+            claimed_domain, claimed_slot = self._claim(mCounters, mSmDomains)
+            sClaim[0] = claimed_domain
+            sClaim[1] = claimed_slot
         sPacked = storage.sPacked.get_tensor(sPacked_layout.outer, swizzle=sPacked_layout.inner)
         sScale = storage.sScale.get_tensor(sScale_layout)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -696,6 +757,21 @@ class Q8KV4DecodeIndexerSm100:
         pipeline.pipeline_init_wait()
         # PDL: the predecessor writes q and the current pages of the index cache.
         cute.arch.griddepcontrol_wait()
+        if tidx == Int32(0) and cute.arch.block_idx()[0] == Int32(0):
+            # The previous launch has completed: zero its counters for its next use.
+            for counter in cutlass.range_constexpr(NUM_DOMAINS):
+                mClearCounters[counter] = Int32(0)
+        claim_barrier = pipeline.NamedBarrier(
+            barrier_id=int(_NamedBarrier.Claim),
+            num_threads=self.threads_per_cta,
+        )
+        claim_barrier.arrive_and_wait()
+        domain = sClaim[0]
+        slot = sClaim[1]
+        domain_ctas = Int32(self.domain_ctas[0])
+        if domain == Int32(1):
+            domain_ctas = Int32(self.domain_ctas[1])
+        mScheduler = mDomSched[domain, None]
         # The plan writes the scheduler prefix sums just before this launch, so
         # they are read only after the PDL wait. Lane 0 of every warp reads
         # them; a read before the wait could give warps different page counts.
@@ -703,14 +779,16 @@ class Q8KV4DecodeIndexerSm100:
         if lane_idx == Int32(0):
             total_pages = mScheduler[batch_size]
         total_pages = cute.arch.shuffle_sync(total_pages, 0)
-        pages_per_worker = (total_pages + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
-        global_page_begin = worker_idx * pages_per_worker
+        pages_per_worker = (total_pages + domain_ctas - Int32(1)) // domain_ctas
+        global_page_begin = Int32(0)
         num_pages = Int32(0)
-        if global_page_begin < total_pages:
-            global_page_end = global_page_begin + pages_per_worker
-            if global_page_end > total_pages:  # noqa: PLR1730
-                global_page_end = total_pages
-            num_pages = global_page_end - global_page_begin
+        if slot >= Int32(0):
+            global_page_begin = slot * pages_per_worker
+            if global_page_begin < total_pages:
+                global_page_end = global_page_begin + pages_per_worker
+                if global_page_end > total_pages:  # noqa: PLR1730
+                    global_page_end = total_pages
+                num_pages = global_page_end - global_page_begin
 
         batch_idx = Int32(0)
         if lane_idx == Int32(0):
@@ -722,7 +800,8 @@ class Q8KV4DecodeIndexerSm100:
                 else:
                     batch_hi = batch_mid
         batch_idx = cute.arch.shuffle_sync(batch_idx, 0)
-        logical_page_begin = global_page_begin - mScheduler[batch_idx]
+        # The k-th page of a request in this domain is logical page 2k + domain.
+        logical_page_begin = (global_page_begin - mScheduler[batch_idx]) * Int32(2) + domain
         thr_mma = tiled_mma.get_slice(0)
         tmem_ptr = tmem.retrieve_ptr(Float32)
         if cutlass.const_expr(self.split_tmem):
@@ -798,6 +877,9 @@ class Q8KV4DecodeIndexerSm100:
 
         # Small steps leave most CTAs without pages: on SM107 those go straight
         # to the final barrier and TMEM free (num_pages >= 0 elsewhere).
+        if num_pages == Int32(0):
+            # No scores to write: release the dependents right away.
+            cute.arch.griddepcontrol_launch_dependents()
         if num_pages > Int32(self.empty_cta_pages):
             if warp_idx == Int32(1):
                 current_batch = batch_idx
@@ -839,7 +921,7 @@ class Q8KV4DecodeIndexerSm100:
                             chunk_pages = Int32(self.threads_per_warp)
                         lane_page = Int32(0)
                         if lane_idx < chunk_pages:
-                            lane_page = mPageTable_lb[logical_page + lane_idx, current_batch]
+                            lane_page = mPageTable_lb[logical_page + Int32(2) * lane_idx, current_batch]
                         for chunk_page in cutlass.range(chunk_pages, unroll=1):
                             physical_page = cute.arch.shuffle_sync(lane_page, chunk_page)
                             raw_empty = raw_producer.acquire_and_advance()
@@ -856,14 +938,14 @@ class Q8KV4DecodeIndexerSm100:
                                 tma_bar_ptr=raw_empty.barrier,
                             )
                         global_page += chunk_pages
-                        logical_page += chunk_pages
+                        logical_page += Int32(2) * chunk_pages
                     pages_remaining -= segment_pages
                     while (
                         current_batch < batch_size - Int32(1)
                         and mScheduler[current_batch + 1] <= global_page
                     ):
                         current_batch += Int32(1)
-                        logical_page = global_page - mScheduler[current_batch]
+                        logical_page = (global_page - mScheduler[current_batch]) * Int32(2) + domain
                 raw_producer.tail()
                 if cutlass.const_expr(self.merge_q_loader and not self.use_fp16_mma):
                     q_producer.tail()
@@ -1036,14 +1118,14 @@ class Q8KV4DecodeIndexerSm100:
                             if logical_page < local_block:
                                 mOut_pqb[logical_page, query_idx, current_batch] = row_max
                         global_page += Int32(1)
-                        logical_page += Int32(1)
+                        logical_page += Int32(2)
                     pages_remaining -= segment_pages
                     while (
                         current_batch < batch_size - Int32(1)
                         and mScheduler[current_batch + 1] <= global_page
                     ):
                         current_batch += Int32(1)
-                        logical_page = global_page - mScheduler[current_batch]
+                        logical_page = (global_page - mScheduler[current_batch]) * Int32(2) + domain
                     if score_warp_idx == Int32(0) and lane_idx < Int32(self.num_queries):
                         seq_len = mSeqLens[current_batch]
                         query_position = (
@@ -1250,4 +1332,4 @@ class Q8KV4DecodeIndexerSm100:
         k_producer.tail()
 
 
-__all__ = ["Q8KV4DecodeIndexerSm100"]
+__all__ = ["Q8KV4DecodeIndexerLocalizedSm100"]
