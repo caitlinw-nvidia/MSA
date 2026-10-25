@@ -995,7 +995,9 @@ class Q8KV8PrefillIndexerSm100:
             tmem.relinquish_alloc_permit()
         pipeline.sync(barrier_id=int(NamedBarrierIndexerSm100.Final))
         if cutlass.const_expr(self.two_ctas_per_sm):
-            cute.arch.cluster_arrive()
+            # Relaxed: every cross-CTA arrive this CTA issued is already observed
+            # by the peer's producer_tail waits, so no release ordering is needed.
+            cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
         tmem.free(tmem_ptr)
 
