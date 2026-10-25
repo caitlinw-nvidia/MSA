@@ -295,6 +295,15 @@ class Q8KV8PrefillIndexerSm100:
             )
 
     @cute.jit
+    def _load_task_counts(self, mTaskCounts: cute.Tensor) -> cutlass.Int32:
+        """Lane b holds bucket b's task count: one parallel load instead of a
+        dependent global load per bucket on the way to the first task."""
+        count = cutlass.Int32(0)
+        if cute.arch.lane_idx() < cutlass.Int32(self.num_task_buckets):
+            count = mTaskCounts[cute.arch.lane_idx()]
+        return count
+
+    @cute.jit
     def _get_task_descriptor(
         self,
         bucket: cutlass.Int32,
@@ -452,9 +461,14 @@ class Q8KV8PrefillIndexerSm100:
             byte_alignment=128,
             swizzle=k_smem_layout.inner,
         )
+        # SM107: only the score warps and the MMA warp touch TMEM, so the Q and
+        # K loaders start their first loads without waiting for the allocation.
+        tmem_users = self.threads_per_cta
+        if cutlass.const_expr(self.two_ctas_per_sm):
+            tmem_users = cute.arch.WARP_SIZE * (len(self.score_warp_ids) + 1)
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierIndexerSm100.TmemPtr),
-            num_threads=self.threads_per_cta,
+            num_threads=tmem_users,
         )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buffer,
@@ -545,7 +559,11 @@ class Q8KV8PrefillIndexerSm100:
         if cutlass.const_expr(self.two_ctas_per_sm):
             # Release the TMEM allocation permit right away so a second CTA can launch on this SM.
             tmem.relinquish_alloc_permit()
-        tmem.wait_for_alloc()
+        if cutlass.const_expr(self.two_ctas_per_sm):
+            if warp_idx <= self.score_warp_ids[-1] or warp_idx == self.mma_warp_id:
+                tmem.wait_for_alloc()
+        else:
+            tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
         # SM107 reads each 128-column accumulator row in two 64-column halves.
@@ -604,10 +622,11 @@ class Q8KV8PrefillIndexerSm100:
                 score_warp = warp_idx
                 # Buckets in decreasing cost; cluster c takes every N-th task of each,
                 # and the start rotates by each bucket's count so leftovers spread out.
+                task_counts = self._load_task_counts(mTaskCounts)
                 worker_base = cutlass.Int32(0)
                 for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                     bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                    task_count = mTaskCounts[bucket]
+                    task_count = cute.arch.shuffle_sync(task_counts, bucket)
                     task_idx = cluster_idx - worker_base
                     if task_idx < cutlass.Int32(0):
                         task_idx += cutlass.Int32(self.num_persistent_clusters)
@@ -684,10 +703,11 @@ class Q8KV8PrefillIndexerSm100:
                 if tile_worker_idx == cutlass.Int32(1):
                     acc_consumer_state.advance()
                 tile_base = cutlass.Int32(0)
+                task_counts = self._load_task_counts(mTaskCounts)
                 worker_base = cutlass.Int32(0)
                 for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                     bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                    task_count = mTaskCounts[bucket]
+                    task_count = cute.arch.shuffle_sync(task_counts, bucket)
                     task_idx = cluster_idx - worker_base
                     if task_idx < cutlass.Int32(0):
                         task_idx += cutlass.Int32(self.num_persistent_clusters)
@@ -767,10 +787,11 @@ class Q8KV8PrefillIndexerSm100:
             )
             # Buckets in decreasing cost; cluster c takes every N-th task of each,
             # and the start rotates by each bucket's count so leftovers spread out.
+            task_counts = self._load_task_counts(mTaskCounts)
             worker_base = cutlass.Int32(0)
             for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                task_count = mTaskCounts[bucket]
+                task_count = cute.arch.shuffle_sync(task_counts, bucket)
                 task_idx = cluster_idx - worker_base
                 if task_idx < cutlass.Int32(0):
                     task_idx += cutlass.Int32(self.num_persistent_clusters)
@@ -831,10 +852,11 @@ class Q8KV8PrefillIndexerSm100:
             )
             # Buckets in decreasing cost; cluster c takes every N-th task of each,
             # and the start rotates by each bucket's count so leftovers spread out.
+            task_counts = self._load_task_counts(mTaskCounts)
             worker_base = cutlass.Int32(0)
             for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                task_count = mTaskCounts[bucket]
+                task_count = cute.arch.shuffle_sync(task_counts, bucket)
                 task_idx = cluster_idx - worker_base
                 if task_idx < cutlass.Int32(0):
                     task_idx += cutlass.Int32(self.num_persistent_clusters)
@@ -915,10 +937,11 @@ class Q8KV8PrefillIndexerSm100:
             if is_leader_cta:
                 # Buckets in decreasing cost; cluster c takes every N-th task of each,
                 # and the start rotates by each bucket's count so leftovers spread out.
+                task_counts = self._load_task_counts(mTaskCounts)
                 worker_base = cutlass.Int32(0)
                 for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                     bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
-                    task_count = mTaskCounts[bucket]
+                    task_count = cute.arch.shuffle_sync(task_counts, bucket)
                     task_idx = cluster_idx - worker_base
                     if task_idx < cutlass.Int32(0):
                         task_idx += cutlass.Int32(self.num_persistent_clusters)
