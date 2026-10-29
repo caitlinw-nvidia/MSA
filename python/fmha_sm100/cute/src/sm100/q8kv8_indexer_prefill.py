@@ -168,6 +168,10 @@ class Q8KV8PrefillIndexerSm100:
         # sizes up to 512 only (no single 576-column block).
         self.q_in_tmem = self.use_sm107_fp8_mma and not self.two_ctas_per_sm
         self.q_tmem_cols = self.q_stages * self.head_dim * 8 // 32
+        # SM107, one CTA per SM: warp 11 (otherwise idle) is a second K loader so
+        # K page TMAs keep up with the cheaper TMEM-A MMAs.
+        self.num_k_loaders = 2 if self.q_in_tmem else 1
+        self.k_load_warp_id2 = 11 if self.q_in_tmem else -1
         if self.q_in_tmem:
             assert self.acc_stages * self.k_tile == self.tmem_alloc_cols
             assert self.tmem_alloc_cols + self.q_tmem_cols <= 576
@@ -464,7 +468,7 @@ class Q8KV8PrefillIndexerSm100:
 
         if warp_idx == self.q_load_warp_id:
             cpasync.prefetch_descriptor(q_tma_atom)
-        if warp_idx == self.k_load_warp_id:
+        if warp_idx == self.k_load_warp_id or warp_idx == self.k_load_warp_id2:
             cpasync.prefetch_descriptor(k_tma_atom)
 
         smem = utils.SmemAllocator()
@@ -902,12 +906,16 @@ class Q8KV8PrefillIndexerSm100:
                     worker_base + task_count
                 ) % cutlass.Int32(self.num_persistent_clusters)
             q_pipe.producer_tail(q_producer_state)
-        elif warp_idx == self.k_load_warp_id:
+        elif warp_idx == self.k_load_warp_id or warp_idx == self.k_load_warp_id2:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             k_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.k_stages,
             )
+            # Which of the num_k_loaders loaders this warp is (0: warp 9, 1: warp 11),
+            # and how many pages this CTA has walked so far (decides page ownership).
+            k_loader = (warp_idx - cutlass.Int32(self.k_load_warp_id)) // cutlass.Int32(2)
+            pages_seen = cutlass.Int32(0)
             # Buckets in decreasing cost; cluster c takes every N-th task of each,
             # and the start rotates by each bucket's count so leftovers spread out.
             task_counts = self._load_task_counts(mTaskCounts)
@@ -936,26 +944,32 @@ class Q8KV8PrefillIndexerSm100:
                         # the TMA issue path; fetch the next page's index while
                         # this page's TMA is issued so the two latencies overlap.
                         # The last iteration re-reads the final entry (in bounds).
+                        # With two loaders, page (pages_seen + tile_idx) belongs to loader
+                        # (pages_seen + tile_idx) % 2; each prefetches its next own page's index.
+                        nk = cutlass.Int32(self.num_k_loaders)
                         last_page = page_begin + page_count - cutlass.Int32(1)
-                        physical_page = mPageTable[batch_idx, page_begin]
+                        first_own = (k_loader + nk - pages_seen % nk) % nk
+                        physical_page = mPageTable[
+                            batch_idx, cutlass.min(page_begin + first_own, last_page)
+                        ]
                         for tile_idx in cutlass.range(page_count, unroll=1):
-                            logical_page = page_begin + tile_idx
-                            next_page = cutlass.min(
-                                logical_page + cutlass.Int32(1), last_page
-                            )
-                            next_physical_page = mPageTable[batch_idx, next_page]
-                            k_pipe.producer_acquire(k_producer_state)
-                            cute.copy(
-                                k_tma_atom,
-                                tKgK[(None, 0, physical_page)],
-                                tKsK[(None, k_producer_state.index)],
-                                tma_bar_ptr=k_pipe.producer_get_barrier(
-                                    k_producer_state
-                                ),
-                                mcast_mask=k_mcast_mask,
-                            )
+                            if (pages_seen + tile_idx) % nk == k_loader:
+                                logical_page = page_begin + tile_idx
+                                next_page = cutlass.min(logical_page + nk, last_page)
+                                next_physical_page = mPageTable[batch_idx, next_page]
+                                k_pipe.producer_acquire(k_producer_state)
+                                cute.copy(
+                                    k_tma_atom,
+                                    tKgK[(None, 0, physical_page)],
+                                    tKsK[(None, k_producer_state.index)],
+                                    tma_bar_ptr=k_pipe.producer_get_barrier(
+                                        k_producer_state
+                                    ),
+                                    mcast_mask=k_mcast_mask,
+                                )
+                                physical_page = next_physical_page
                             k_producer_state.advance()
-                            physical_page = next_physical_page
+                        pages_seen += page_count
                     else:
                         physical_page = cutlass.Int32(0)
                         for tile_idx in cutlass.range(page_count, unroll=1):
