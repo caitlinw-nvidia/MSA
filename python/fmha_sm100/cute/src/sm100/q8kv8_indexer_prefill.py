@@ -39,6 +39,9 @@ class Q8KV8PrefillIndexerSm100:
     k_stages = 12
     acc_stages = 4
     ctas_per_sm = 1
+    # SM107: False runs the one 12-warp CTA per SM layout above with Q as the
+    # MMA's TMEM A operand (q_in_tmem); True runs two 8-warp CTAs per SM.
+    sm107_two_ctas_per_sm = False
     num_task_buckets = 8
     # Pages per coalesced score store group, and the padded row pitch of the
     # per-warp staging tile (odd, so row-major writes avoid bank conflicts).
@@ -64,14 +67,18 @@ class Q8KV8PrefillIndexerSm100:
 
     @classmethod
     def uses_two_ctas_per_sm(cls, compute_capability: tuple[int, int]) -> bool:
-        """SM107 runs two 8-warp CTAs per SM and stages its score writes."""
-        return compute_capability == (10, 7)
+        """SM107 with sm107_two_ctas_per_sm: two 8-warp CTAs per SM, staged score writes."""
+        return compute_capability == (10, 7) and cls.sm107_two_ctas_per_sm
 
     @classmethod
     def launch_config(cls, compute_capability: tuple[int, int]) -> tuple[int, int, int]:
         """(CTAs per SM, K stages, accumulator stages) for an architecture."""
         if cls.uses_two_ctas_per_sm(compute_capability):
             return 2, 8, 2
+        if compute_capability == (10, 7):
+            # One CTA per SM: the SMEM of the two former CTAs (16 K stages of
+            # 8 KB) and 4 accumulator stages (512 TMEM columns; Q takes 64 more).
+            return 1, 16, 4
         return cls.ctas_per_sm, cls.k_stages, cls.acc_stages
 
     @classmethod
@@ -153,6 +160,17 @@ class Q8KV8PrefillIndexerSm100:
             self.tmem_alloc_cols = self.acc_stages * self.k_tile
         else:
             self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        # SM107, one CTA per SM: Q is the MMA's A operand from TMEM. The 4
+        # accumulator stages fill columns 0-511; the 2 Q stages (128 rows x 128
+        # E4M3, four per column: 32 columns each) are a second 64-column
+        # allocation, which lands at columns 512-575 since no other CTA on the SM
+        # holds TMEM. Two allocations because the allocator takes power-of-two
+        # sizes up to 512 only (no single 576-column block).
+        self.q_in_tmem = self.use_sm107_fp8_mma and not self.two_ctas_per_sm
+        self.q_tmem_cols = self.q_stages * self.head_dim * 8 // 32
+        if self.q_in_tmem:
+            assert self.acc_stages * self.k_tile == self.tmem_alloc_cols
+            assert self.tmem_alloc_cols + self.q_tmem_cols <= 576
 
     @cute.jit
     def __call__(
@@ -190,6 +208,22 @@ class Q8KV8PrefillIndexerSm100:
                 OperandMajorMode.K,
             )
         tiled_mma = cute.make_tiled_mma(op)
+        # The Q TMA and SMEM layouts come from the SMEM-operand MMA; with Q in
+        # TMEM the MMA warp issues the same instruction shape with A from TMEM.
+        tiled_mma_q = tiled_mma
+        if cutlass.const_expr(self.q_in_tmem):
+            tiled_mma_q = cute.make_tiled_mma(
+                tcgen05.SM107MmaFP8Op(
+                    self.io_dtype,
+                    self.io_dtype,
+                    self.acc_dtype,
+                    self.mma_inst_shape_mnk,
+                    tcgen05.CtaGroup.TWO,
+                    tcgen05.OperandSource.TMEM,
+                    OperandMajorMode.K,
+                    OperandMajorMode.K,
+                )
+            )
         q_smem_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler_mnk,
@@ -250,13 +284,16 @@ class Q8KV8PrefillIndexerSm100:
             k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.k_stages * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.acc_stages * 2]
             tmem_dealloc_mbar: cutlass.Int64
+            q_tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buffer: cutlass.Int32
+            q_tmem_holding_buffer: cutlass.Int32
             score_buf: cute.struct.MemRange[cutlass.Float32, score_buf_words]
             score_row_limit: cute.struct.MemRange[cutlass.Int32, row_limit_words]
 
         self.shared_storage = SharedStorage
         launcher = self.kernel(
             tiled_mma,
+            tiled_mma_q,
             q_tma_atom,
             q_tma_tensor,
             k_tma_atom,
@@ -271,7 +308,7 @@ class Q8KV8PrefillIndexerSm100:
             num_heads,
         )
         grid = (self.num_persistent_clusters * self.cta_group_size, 1, 1)
-        if cutlass.const_expr(self.two_ctas_per_sm):
+        if cutlass.const_expr(self.compute_capability == (10, 7)):
             launcher.launch(
                 grid=grid,
                 block=(self.threads_per_cta, 1, 1),
@@ -402,6 +439,7 @@ class Q8KV8PrefillIndexerSm100:
     def kernel(
         self,
         tiled_mma: cute.TiledMma,
+        tiled_mma_q: cute.TiledMma,
         q_tma_atom: cute.CopyAtom,
         q_tma_tensor: cute.Tensor,
         k_tma_atom: cute.CopyAtom,
@@ -464,7 +502,7 @@ class Q8KV8PrefillIndexerSm100:
         # SM107: only the score warps and the MMA warp touch TMEM, so the Q and
         # K loaders start their first loads without waiting for the allocation.
         tmem_users = self.threads_per_cta
-        if cutlass.const_expr(self.two_ctas_per_sm):
+        if cutlass.const_expr(self.compute_capability == (10, 7)):
             tmem_users = cute.arch.WARP_SIZE * (len(self.score_warp_ids) + 1)
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierIndexerSm100.TmemPtr),
@@ -477,6 +515,15 @@ class Q8KV8PrefillIndexerSm100:
             is_two_cta=True,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
+        tmem_q = tmem
+        if cutlass.const_expr(self.q_in_tmem):
+            tmem_q = utils.TmemAllocator(
+                storage.q_tmem_holding_buffer,
+                barrier_for_retrieve=tmem_alloc_barrier,
+                allocator_warp_id=self.mma_warp_id,
+                is_two_cta=True,
+                two_cta_tmem_dealloc_mbar_ptr=storage.q_tmem_dealloc_mbar.ptr,
+            )
         thread_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         q_tma_bytes = (
             cute.size_in_bytes(
@@ -556,21 +603,28 @@ class Q8KV8PrefillIndexerSm100:
 
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
         tmem.allocate(self.tmem_alloc_cols)
+        if cutlass.const_expr(self.q_in_tmem):
+            # After the 512-column block, so it lands at column 512; one retrieve
+            # barrier covers both allocations.
+            tmem_q.allocate(self.q_tmem_cols)
         if cutlass.const_expr(self.two_ctas_per_sm):
             # Release the TMEM allocation permit right away so a second CTA can launch on this SM.
             tmem.relinquish_alloc_permit()
-        if cutlass.const_expr(self.two_ctas_per_sm):
+        if cutlass.const_expr(self.compute_capability == (10, 7)):
             if warp_idx <= self.score_warp_ids[-1] or warp_idx == self.mma_warp_id:
                 tmem.wait_for_alloc()
         else:
             tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+        q_tmem_ptr = tmem_ptr
+        if cutlass.const_expr(self.q_in_tmem):
+            q_tmem_ptr = tmem_q.retrieve_ptr(self.acc_dtype)
         # SM107 reads each 128-column accumulator row in two 64-column halves.
         tmem_chunks = 1
         tmem_repetition = tcgen05.Repetition.x128
         tmem_reduce_repetition = tcgen05.copy.Repetition.x128
-        if cutlass.const_expr(self.two_ctas_per_sm):
+        if cutlass.const_expr(self.compute_capability == (10, 7)):
             tmem_chunks = 2
             tmem_repetition = tcgen05.Repetition.x64
             tmem_reduce_repetition = tcgen05.copy.Repetition.x64
@@ -751,7 +805,7 @@ class Q8KV8PrefillIndexerSm100:
                                 (None, None, None, None, acc_consumer_state.index)
                             ]
                             if cutlass.const_expr(self.use_tmem_load_reduce):
-                                for chunk in cutlass.range_constexpr(1):
+                                for chunk in cutlass.range_constexpr(tmem_chunks):
                                     cute.copy_atom_call(
                                         tmem_load_reduce_atom,
                                         tTR_tAcc[(None, chunk, 0, 0)],
@@ -769,6 +823,10 @@ class Q8KV8PrefillIndexerSm100:
                             if q_valid and logical_page < local_block:
                                 if cutlass.const_expr(self.use_tmem_load_reduce):
                                     block_max = tTR_rBlockMax[(0, 0)]
+                                    if cutlass.const_expr(tmem_chunks == 2):
+                                        block_max = cute.arch.fmax(
+                                            block_max, tTR_rBlockMax[(0, 1)]
+                                        )
                                 else:
                                     block_max = self._reduce_accumulator_row(tTR_rAcc)
                                 mScores[q_global, logical_page] = block_max
@@ -934,6 +992,26 @@ class Q8KV8PrefillIndexerSm100:
                 self.acc_stages,
             )
             num_k_blocks = cute.size(tCrQ, mode=[2])
+            tCrQ_mma = tCrQ
+            if cutlass.const_expr(self.q_in_tmem):
+                # The Q stages in TMEM (columns 512-575), in the A-operand layout.
+                tCrQ_mma = cute.make_tensor(
+                    cute.recast_ptr(q_tmem_ptr, dtype=self.io_dtype),
+                    tiled_mma_q.make_fragment_A(q_smem_layout.outer).layout,
+                )
+                # One 128-row x 256-bit SMEM -> TMEM copy per 32 bytes of each Q
+                # row; the 2-CTA form fills each CTA's TMEM from its own SMEM.
+                q_s2t = tcgen05.make_s2t_copy(
+                    cute.make_copy_atom(
+                        tcgen05.Cp128x256bOp(tcgen05.CtaGroup.TWO), self.io_dtype
+                    ),
+                    tCrQ_mma[(None, None, None, 0)],
+                )
+                thr_q_s2t = q_s2t.get_slice(0)
+                tQsQ_s2t = tcgen05.get_s2t_smem_desc_tensor(
+                    q_s2t, thr_q_s2t.partition_S(sQ)
+                )
+                tQtQ_s2t = thr_q_s2t.partition_D(tCrQ_mma)
             if is_leader_cta:
                 # Buckets in decreasing cost; cluster c takes every N-th task of each,
                 # and the start rotates by each bucket's count so leftovers spread out.
@@ -959,6 +1037,23 @@ class Q8KV8PrefillIndexerSm100:
                             mTaskDescriptors,
                         )
                         q_pipe.consumer_wait(q_consumer_state)
+                        if cutlass.const_expr(self.q_in_tmem):
+                            # TMEM Q stage s is reused two tasks later. Its last
+                            # readers (that task's MMAs) completed before the
+                            # consumer_release below freed SMEM stage s, which the
+                            # Q load observed by this wait had to wait for: no
+                            # extra barrier and no pipe drain at the task boundary.
+                            # The copy is ordered before this task's MMAs (same
+                            # issuing thread).
+                            cute.copy(
+                                q_s2t,
+                                tQsQ_s2t[
+                                    (None, None, None, None, q_consumer_state.index)
+                                ],
+                                tQtQ_s2t[
+                                    (None, None, None, None, q_consumer_state.index)
+                                ],
+                            )
                         for _ in cutlass.range(page_count, unroll=1):
                             k_pipe.consumer_wait(k_consumer_state)
                             acc_pipe.producer_acquire(acc_producer_state)
@@ -970,14 +1065,14 @@ class Q8KV8PrefillIndexerSm100:
                                     acc_producer_state.index,
                                 )
                             ]
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                            tiled_mma_q.set(tcgen05.Field.ACCUMULATE, False)
                             for k_block_idx in cutlass.range_constexpr(
                                 num_k_blocks
                             ):
                                 cute.gemm(
-                                    tiled_mma,
+                                    tiled_mma_q,
                                     tCtAcc,
-                                    tCrQ[
+                                    tCrQ_mma[
                                         (
                                             None,
                                             None,
@@ -995,7 +1090,7 @@ class Q8KV8PrefillIndexerSm100:
                                     ],
                                     tCtAcc,
                                 )
-                                tiled_mma.set(
+                                tiled_mma_q.set(
                                     tcgen05.Field.ACCUMULATE,
                                     True,
                                 )
@@ -1023,6 +1118,8 @@ class Q8KV8PrefillIndexerSm100:
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
         tmem.free(tmem_ptr)
+        if cutlass.const_expr(self.q_in_tmem):
+            tmem_q.free(q_tmem_ptr)
 
 
 __all__ = ["Q8KV8PrefillIndexerSm100"]
