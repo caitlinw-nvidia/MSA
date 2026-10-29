@@ -276,7 +276,7 @@ class Q8KV8PrefillIndexerSm100:
         # Score staging tile and row limits (SM107); one word otherwise.
         score_buf_words = 1
         row_limit_words = 1
-        if cutlass.const_expr(self.two_ctas_per_sm):
+        if cutlass.const_expr(self.two_ctas_per_sm or self.q_in_tmem):
             score_buf_words = (
                 cute.arch.WARP_SIZE * self.score_buf_pitch * len(self.score_warp_ids)
             )
@@ -394,13 +394,27 @@ class Q8KV8PrefillIndexerSm100:
         group_page: cutlass.Int32,
         group_len: cutlass.Int32,
         mScores: cute.Tensor,
+        page_stride: cutlass.Constexpr = 1,
     ):
-        """Write a warp's staged (32 rows x group) maxima, consecutive pages per lane group."""
+        """Write a warp's staged (32 rows x group) maxima; slot j is page group_page + j * page_stride."""
         cute.arch.sync_warp()
         tile_shape = (cute.arch.WARP_SIZE, self.score_group_pages)
         gScores = cute.local_tile(
-            cute.domain_offset((q_row_base, group_page), mScores), tile_shape, (0, 0)
+            cute.domain_offset((q_row_base, group_page), mScores),
+            (cute.arch.WARP_SIZE, self.score_group_pages * page_stride),
+            (0, 0),
         )
+        if cutlass.const_expr(page_stride != 1):
+            # Every page_stride-th column of the (32, 8 * page_stride) tile.
+            gScores = cute.make_tensor(
+                gScores.iterator,
+                cute.composition(
+                    gScores.layout,
+                    cute.make_layout(
+                        tile_shape, stride=(1, cute.arch.WARP_SIZE * page_stride)
+                    ),
+                ),
+            )
         sScores = sScoreBuf[(None, None, score_warp)]
         cScores = cute.make_identity_tensor(tile_shape)
         # 4 rows x 8 pages per store: lanes 8r..8r+7 write consecutive pages of row r.
@@ -418,7 +432,7 @@ class Q8KV8PrefillIndexerSm100:
                 # (0 for rows past the task); branched, not predicated, so the warp
                 # skips stores with no live lane.
                 if col < group_len:
-                    if group_page + col < sRowLimit[(row, score_warp)]:
+                    if group_page + col * page_stride < sRowLimit[(row, score_warp)]:
                         tSgS[(None, m, n)].store(tSsS[(None, m, n)].load())
         cute.arch.sync_warp()
 
@@ -473,7 +487,7 @@ class Q8KV8PrefillIndexerSm100:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        if cutlass.const_expr(self.two_ctas_per_sm):
+        if cutlass.const_expr(self.two_ctas_per_sm or self.q_in_tmem):
             sScoreBuf = storage.score_buf.get_tensor(
                 cute.make_layout(
                     (
@@ -787,6 +801,12 @@ class Q8KV8PrefillIndexerSm100:
                         local_block = (
                             q_position_begin + row_m // num_heads
                         ) >> cutlass.Int32(7)
+                        if cutlass.const_expr(self.q_in_tmem):
+                            row_limit = cutlass.Int32(0)
+                            if q_valid:
+                                row_limit = local_block
+                            cute.arch.sync_warp()
+                            sRowLimit[(cute.arch.lane_idx(), warp_idx)] = row_limit
                         local_start = tile_worker_idx ^ (
                             tile_base & cutlass.Int32(1)
                         )
@@ -824,7 +844,34 @@ class Q8KV8PrefillIndexerSm100:
                             with cute.arch.elect_one():
                                 acc_pipe.consumer_release(acc_consumer_state)
                             logical_page = page_begin + tile_idx
-                            if q_valid and logical_page < local_block:
+                            if cutlass.const_expr(self.q_in_tmem):
+                                # Stage this warp's rows for 8 of its (every other) pages, then
+                                # flush with stride 2; the flush applies the causal row limit.
+                                block_max = tTR_rBlockMax[(0, 0)]
+                                if cutlass.const_expr(tmem_chunks == 2):
+                                    block_max = cute.arch.fmax(
+                                        block_max, tTR_rBlockMax[(0, 1)]
+                                    )
+                                slot = worker_tile_idx % cutlass.Int32(
+                                    self.score_group_pages
+                                )
+                                sScoreBuf[(cute.arch.lane_idx(), slot, warp_idx)] = block_max
+                                if (
+                                    slot == cutlass.Int32(self.score_group_pages - 1)
+                                    or worker_tile_idx == worker_tiles - cutlass.Int32(1)
+                                ):
+                                    self._flush_scores(
+                                        sScoreBuf,
+                                        sRowLimit,
+                                        warp_idx,
+                                        q_global_begin + row_m - cute.arch.lane_idx(),
+                                        logical_page
+                                        - slot * cutlass.Int32(self.score_worker_groups),
+                                        slot + cutlass.Int32(1),
+                                        mScores,
+                                        self.score_worker_groups,
+                                    )
+                            elif q_valid and logical_page < local_block:
                                 if cutlass.const_expr(self.use_tmem_load_reduce):
                                     block_max = tTR_rBlockMax[(0, 0)]
                                     if cutlass.const_expr(tmem_chunks == 2):
