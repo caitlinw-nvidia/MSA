@@ -44,6 +44,7 @@ from src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
 from src.sm100.q8kv8_indexer_decode import Q8KV8DecodeIndexerSm100
 from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
 from src.sm100.q8kv8_indexer_prefill_plan import (
+    Q8KV8PrefillIndexerPlanBalance,
     Q8KV8PrefillIndexerPlanBuild,
     Q8KV8PrefillIndexerPlanReset,
 )
@@ -674,12 +675,20 @@ class _PrefillPlanState:
     topk_indices: torch.Tensor
 
 
+def _prefill_num_clusters(device: torch.device) -> int:
+    ctas_per_sm = Q8KV8PrefillIndexerSm100.launch_config(_require_supported_device(device))[0]
+    return _sm_count(device) * ctas_per_sm // Q8KV8PrefillIndexerSm100.cta_group_size
+
+
 def _run_prefill_plan(state: _PrefillPlanState) -> None:
     capability = _require_supported_device(state.block_table.device)
+    # SM107 (1 CTA/SM, Q in TMEM): tasks are pairs of adjacent Q tiles.
+    pair_tiles = capability == (10, 7)
     plan_static = (
         Q8KV8PrefillIndexerPlanBuild.num_buckets,
         Q8KV8PrefillIndexerPlanBuild.q_tile,
         Q8KV8PrefillIndexerPlanBuild.descriptor_words,
+        pair_tiles,
     )
     reset_compiled = _compile_or_load(
         _cute_kernel_key("q8kv8_indexer_prefill_plan_reset_sm100", capability, *plan_static),
@@ -701,7 +710,7 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
     build_compiled = _compile_or_load(
         _cute_kernel_key("q8kv8_indexer_prefill_plan_build_sm100", capability, *plan_static),
         lambda: cute.compile(
-            Q8KV8PrefillIndexerPlanBuild(),
+            Q8KV8PrefillIndexerPlanBuild(pair_tiles=pair_tiles),
             *_cute_arguments((), build_args),
             Int32(state.num_candidate_q_tiles),
             Int32(state.task_capacity),
@@ -719,6 +728,29 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
         state.num_heads,
         state.max_page_chunk,
     )
+    if pair_tiles:
+        # Stream-K: cut the unit records into one run per persistent cluster.
+        balance_args = (state.task_descriptors, state.plan_error)
+        balance_compiled = _compile_or_load(
+            _cute_kernel_key("q8kv8_indexer_prefill_plan_balance_sm100", capability, *plan_static),
+            lambda: cute.compile(
+                Q8KV8PrefillIndexerPlanBalance(),
+                *_cute_arguments((), balance_args),
+                Int32(state.num_candidate_q_tiles),
+                Int32(state.cu_seqlens_q.numel() - 1),
+                Int32(_prefill_num_clusters(state.block_table.device)),
+                Int32(state.task_capacity),
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--enable-tvm-ffi",
+            ),
+        )
+        balance_compiled(
+            *balance_args,
+            state.num_candidate_q_tiles,
+            state.cu_seqlens_q.numel() - 1,
+            _prefill_num_clusters(state.block_table.device),
+            state.task_capacity,
+        )
 
 
 class BatchPrefillIndexerQ8KV8Wrapper:
@@ -804,8 +836,9 @@ class BatchPrefillIndexerQ8KV8Wrapper:
                 * Q8KV8PrefillIndexerSm100.launch_config((10, 7))[0]
                 // Q8KV8PrefillIndexerSm100.cta_group_size
             )
+            # Tasks are pairs of Q tiles on SM107: count pairs for the chunk cap.
             chunks_per_q_tile = max(
-                1, num_clusters * _PREFILL_TASKS_PER_CLUSTER // q_tile_capacity
+                1, num_clusters * _PREFILL_TASKS_PER_CLUSTER // -(-q_tile_capacity // 2)
             )
             max_page_chunk = max(
                 Q8KV8PrefillIndexerPlanBuild.min_page_chunk,
@@ -818,6 +851,13 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             max_page_chunk = Q8KV8PrefillIndexerPlanBuild.large_page_chunk
         if score_out is not None:
             _check_score_out(score_out, total_rows, max_pages, device)
+        num_candidate_q_tiles = batch * -(-max_seqlen_q * self._num_heads // q_tile)
+        if _require_supported_device(device) == (10, 7):
+            # Stream-K: unit records (bucket 2), run starts (bucket 1, clusters + 1
+            # rows) and at most one extra task per cut (bucket 0).
+            task_capacity = max(
+                task_capacity, num_candidate_q_tiles + _prefill_num_clusters(device) + 2
+            )
         options = {"device": device}
         self._state = _PrefillPlanState(
             cu_seqlens_q=cu_seqlens_q,
@@ -837,7 +877,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             ),
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
-            num_candidate_q_tiles=batch * -(-max_seqlen_q * self._num_heads // q_tile),
+            num_candidate_q_tiles=num_candidate_q_tiles,
             max_page_chunk=max_page_chunk,
             total_q=total_q,
             num_heads=self._num_heads,
