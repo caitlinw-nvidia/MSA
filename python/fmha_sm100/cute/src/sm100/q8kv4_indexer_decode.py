@@ -986,6 +986,17 @@ class Q8KV4DecodeIndexerSm100:
                     rScores.iterator,
                     cute.make_layout(self.num_queries),
                 )
+                # Lane 0 stores the warp's partial maxima as 16-byte vectors: one
+                # (stage, warp) row of sPartialMax is num_queries contiguous floats.
+                rPartialMax = cute.make_rmem_tensor((self.num_queries,), Float32)
+                partial_vec = 4
+                partial_store = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=partial_vec * 32
+                )
+                partial_memspace = sPartialMax.iterator.memspace
+                partial_row_base = sPartialMax.iterator.toint() + score_warp_idx * Int32(
+                    self.num_queries * 4
+                )
                 current_batch = batch_idx
                 logical_page = logical_page_begin
                 global_page = global_page_begin
@@ -1016,9 +1027,30 @@ class Q8KV4DecodeIndexerSm100:
                         )
                         cute.arch.fence_view_async_tmem_load()
                         for query_idx in cutlass.range_constexpr(self.num_queries):
-                            partial_max = cute.arch.warp_redux_sync(rScoresFlat[query_idx], "fmax")
-                            if lane_idx == Int32(0):
-                                sPartialMax[partial_stage, score_warp_idx, query_idx] = partial_max
+                            rPartialMax[query_idx] = cute.arch.warp_redux_sync(
+                                rScoresFlat[query_idx], "fmax"
+                            )
+                        if lane_idx == Int32(0):
+                            partial_row = partial_row_base + partial_stage * Int32(
+                                self.score_warps * self.num_queries * 4
+                            )
+                            for vec in cutlass.range_constexpr(self.num_queries // partial_vec):
+                                cute.copy(
+                                    partial_store,
+                                    cute.make_tensor(
+                                        rPartialMax.iterator + vec * partial_vec,
+                                        cute.make_layout(partial_vec),
+                                    ),
+                                    cute.make_tensor(
+                                        cute.make_ptr(
+                                            Float32,
+                                            partial_row + Int32(vec * partial_vec * 4),
+                                            mem_space=partial_memspace,
+                                            assumed_align=partial_vec * 4,
+                                        ),
+                                        cute.make_layout(partial_vec),
+                                    ),
+                                )
                         acc_full.release()
                         score_barrier.arrive_and_wait()
 
